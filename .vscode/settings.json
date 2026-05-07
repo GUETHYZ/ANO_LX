@@ -1,0 +1,19 @@
+{
+    "files.associations": {
+        "*.dbclient-js": "javascript",
+        "ano_dt_lx.h": "c",
+        "drv_rcin.h": "c",
+        "ano_lx.h": "c",
+        "my_uart.h": "c",
+        "drv_uart.h": "c",
+        "drv_ubloxgps.h": "c",
+        "my_send_test.h": "c",
+        "my_get_data.h": "c",
+        "my_contrl.h": "c",
+        "sysconfig.h": "c",
+        "stm32f4xx.h": "c",
+        "ano_math.h": "c",
+        "my_pid.h": "c",
+        "ano_scheduler.h": "c"
+    }
+}
