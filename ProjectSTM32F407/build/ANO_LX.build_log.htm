@@ -28,11 +28,14 @@ Project File Date:  04/17/2026
 *** Using Compiler 'V5.06 update 5 (build 528)', folder: 'E:\Keil C51\ARM\ARMCC\Bin'
 Build target 'Ano_LX'
 compiling User_Task.c...
+..\FcSrc\User_Task.c(182): warning:  #550-D: variable "s_camera_started"  was set but never used
+  static uint8_t s_camera_started = 0;
+..\FcSrc\User_Task.c: 1 warning, 0 errors
 linking...
-Program Size: Code=57268 RO-data=2112 RW-data=904 ZI-data=6312  
+Program Size: Code=59264 RO-data=2216 RW-data=912 ZI-data=6312  
 FromELF: creating hex file...
 After Build - User command #1: fromelf.exe --bin -o ./ANO-LX.bin ./build/Ano_LX.axf
-".\build\ANO_LX.axf" - 0 Error(s), 0 Warning(s).
+".\build\ANO_LX.axf" - 0 Error(s), 1 Warning(s).
 
 <h2>Software Packages used:</h2>
 

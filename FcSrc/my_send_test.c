@@ -57,6 +57,30 @@ void my_send_esp_1_test(int Data_A)
     DrvUart1SendBuf(DataSend, DataSend[3] + 7);
 }
 
+void my_send_esp_qr_message(uint8_t device, uint8_t qr_type, int16_t qr_x, int16_t qr_y)
+{
+    uint8_t _cnt = 0;
+    uint16_t x_raw = (uint16_t)qr_x;
+    uint16_t y_raw = (uint16_t)qr_y;
+
+    /*
+     * 通用通信协议：AA BB device qr_type xH xL yH yL FF
+     * x/y 为 int16_t 补码，大端序发送，高字节在前。
+     * 这样 ESP32 端可用 (frame[4] << 8) | frame[5] 还原为 int16_t。
+     */
+    DataSend[_cnt++] = RESCUE_HEAD_1;                  // 0xAA
+    DataSend[_cnt++] = RESCUE_HEAD_2;                  // 0xBB
+    DataSend[_cnt++] = device;                         // 目标设备 / 设备类型
+    DataSend[_cnt++] = qr_type;                        // 二维码类型：0xCA / 0xCB / 0xCC
+    DataSend[_cnt++] = (uint8_t)((x_raw >> 8) & 0xFF); // X 高字节
+    DataSend[_cnt++] = (uint8_t)(x_raw & 0xFF);        // X 低字节
+    DataSend[_cnt++] = (uint8_t)((y_raw >> 8) & 0xFF); // Y 高字节
+    DataSend[_cnt++] = (uint8_t)(y_raw & 0xFF);        // Y 低字节
+    DataSend[_cnt++] = RESCUE_TAIL;                    // 0xFF
+
+    DrvUart1SendBuf(DataSend, RESCUE_FRAME_LEN);
+}
+
 void my_send_maixcam(uint8_t code_type)
 {
     uint8_t _cnt = 0;

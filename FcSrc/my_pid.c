@@ -24,8 +24,8 @@ int32_t yaw_output_max = 30;
 
 // 位置环速度上限，可由任务层动态修改
 int32_t g_xy_limit_optical = 30;
-int32_t g_xy_limit_radar = 30;
-int32_t g_xy_limit_mv = 20;
+int32_t g_xy_limit_radar = 25;
+int32_t g_xy_limit_mv = 15;
 
 #define CAM_DEADBAND_CM 0.5
 #define CAM_D_LIMIT_CMPS 8

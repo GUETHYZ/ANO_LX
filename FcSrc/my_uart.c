@@ -235,7 +235,18 @@ int MY_uart_esp_anl(uint8_t *data, uint8_t len)
         dis_y_cam_target = 0;
 
         MY_uart_maixcam_send(message);
-        my_send_esp_1_test(message);      /* 调试回传：确认收到并已转发的二维码类型 */
+        // if(message==QR_CODE_A)
+        // {
+        //     my_send_esp_qr_message(DEVICE_BROADCAST, message, -111, 222);
+        // }
+        // else if (message==QR_CODE_B)
+        // {
+        //     my_send_esp_qr_message(DEVICE_BROADCAST, message, -333, 444);
+        // }
+        // else if (message==QR_CODE_C)
+        // {
+        //     my_send_esp_qr_message(DEVICE_BROADCAST, message, -555, 666);
+        // }
         return 20;
     }
 
