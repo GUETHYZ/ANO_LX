@@ -9,6 +9,14 @@ extern int16_t OpenMV_data_0, OpenMV_data_1, OpenMV_data_2;
 extern int my_task_flag; // 任务标志位，0表示空闲，1*表示有任务
 extern uint8_t my_slam_flag;
 
+extern volatile uint8_t g_radar3d_last_msg_id;
+extern volatile int16_t g_radar3d_last_x;
+extern volatile int16_t g_radar3d_last_y;
+extern volatile int16_t g_radar3d_last_z;
+extern volatile int16_t g_radar3d_last_roll;
+extern volatile int16_t g_radar3d_last_pitch;
+extern volatile int16_t g_radar3d_last_yaw;
+
 extern volatile uint16_t g_maixcam_valid_frame_cnt;
 extern volatile uint8_t g_maixcam_last_code;
 extern volatile uint8_t g_maixcam_last_ctrl;

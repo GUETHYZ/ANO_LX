@@ -21,9 +21,24 @@
 #define CAM_CTRL_FC               0x50
 #define CAM_CTRL_CAM              0x60
 
+#define RADAR3D_FRAME_HEAD        0xAA
+#define RADAR3D_FRAME_END         0x0A
+#define RADAR3D_FRAME_LEN         15
+#define RADAR3D_MSG_ID_MIN        0x01
+#define RADAR3D_MSG_ID_MAX        0x03
+
 int my_task_flag;                 /* 任务标志位，0表示空闲，1表示有任务 */
 uint8_t my_slam_flag = 0;
 int16_t OpenMV_data_0, OpenMV_data_1, OpenMV_data_2;
+
+/* 三维激光雷达原始数据缓存：单位与雷达协议一致，位置为cm，姿态角为度。 */
+volatile uint8_t g_radar3d_last_msg_id = 0;
+volatile int16_t g_radar3d_last_x = 0;
+volatile int16_t g_radar3d_last_y = 0;
+volatile int16_t g_radar3d_last_z = 0;
+volatile int16_t g_radar3d_last_roll = 0;
+volatile int16_t g_radar3d_last_pitch = 0;
+volatile int16_t g_radar3d_last_yaw = 0;
 
 volatile uint16_t g_maixcam_valid_frame_cnt = 0;
 volatile uint8_t g_maixcam_last_code = 0;
@@ -253,17 +268,33 @@ int MY_uart_esp_anl(uint8_t *data, uint8_t len)
     return -1;
 }
 
-/* 雷达 -> 飞控：14字节帧 FA signX xH xM xL signY yH yM yL signYaw yawH yawM yawL AB */
+/* 三维激光雷达 -> 飞控：15字节帧
+ * 波特率：115200，8N1
+ * 格式：AA id xH xL yH yL zH zL rollH rollL pitchH pitchL yawH yawL 0A
+ * 数据：X/Y/Z/roll/pitch/yaw 均为 int16，大端高字节在前。
+ * 单位：X/Y/Z 为 cm，roll/pitch/yaw 为 °。
+ * 示例：AA 01 00 64 FF CE 00 1E 00 0A FF FB 00 5A 0A
+ *       x=100cm, y=-50cm, z=30cm, roll=10°, pitch=-5°, yaw=90°
+ */
 void MY_uart_radio_receive(uint8_t data)
 {
     static uint8_t rxstate = 0;
-    static uint8_t slam_datatemp[14];
+    static uint8_t slam_datatemp[RADAR3D_FRAME_LEN];
     static uint8_t data_index = 0;
+
+    /* 重同步：中途再次遇到帧头0xAA，认为新帧重新开始，避免丢字节后持续错位。 */
+    if (data == RADAR3D_FRAME_HEAD && rxstate != 0)
+    {
+        data_index = 0;
+        slam_datatemp[data_index++] = data;
+        rxstate = 1;
+        return;
+    }
 
     switch (rxstate)
     {
     case 0:
-        if (data == 0xFA)
+        if (data == RADAR3D_FRAME_HEAD)
         {
             data_index = 0;
             slam_datatemp[data_index++] = data;
@@ -272,6 +303,19 @@ void MY_uart_radio_receive(uint8_t data)
         break;
 
     case 1:
+        /* 消息ID：协议给出0x01/0x02/0x03，当前定位版通常只有0x01。 */
+        if (data >= RADAR3D_MSG_ID_MIN && data <= RADAR3D_MSG_ID_MAX)
+        {
+            slam_datatemp[data_index++] = data;
+            rxstate = 2;
+        }
+        else
+        {
+            data_index = 0;
+            rxstate = 0;
+        }
+        break;
+
     case 2:
     case 3:
     case 4:
@@ -283,15 +327,18 @@ void MY_uart_radio_receive(uint8_t data)
     case 10:
     case 11:
     case 12:
+    case 13:
         slam_datatemp[data_index++] = data;
         rxstate++;
         break;
 
-    case 13:
+    case 14:
         slam_datatemp[data_index++] = data;
-        if (data_index == 14 && slam_datatemp[0] == 0xFA && slam_datatemp[13] == 0xAB)
+        if (data_index == RADAR3D_FRAME_LEN &&
+            slam_datatemp[0] == RADAR3D_FRAME_HEAD &&
+            slam_datatemp[14] == RADAR3D_FRAME_END)
         {
-            if (MY_uart_radio_anl(slam_datatemp, 14) == 0)
+            if (MY_uart_radio_anl(slam_datatemp, RADAR3D_FRAME_LEN) == 0)
             {
                 my_slam_flag = 1;
             }
@@ -317,49 +364,59 @@ void MY_uart_radio_receive(uint8_t data)
     }
 }
 
+static int16_t radar3d_get_int16_be(uint8_t high, uint8_t low)
+{
+    return (int16_t)(((uint16_t)high << 8) | (uint16_t)low);
+}
+
 int MY_uart_radio_anl(uint8_t *data, uint8_t len)
 {
-    int32_t x_position;
-    int32_t y_position;
-    int32_t yaw_angle;
+    int16_t x_position;
+    int16_t y_position;
+    int16_t z_position;
+    int16_t roll_angle;
+    int16_t pitch_angle;
+    int16_t yaw_angle;
 
-    if (len != 14)
+    if (len != RADAR3D_FRAME_LEN)
     {
         return -1;
     }
 
-    if (data[0] != 0xFA || data[13] != 0xAB)
+    if (data[0] != RADAR3D_FRAME_HEAD || data[14] != RADAR3D_FRAME_END)
     {
         return -1;
     }
 
-    if ((data[1] != 0x00 && data[1] != 0x01) ||
-        (data[5] != 0x00 && data[5] != 0x01) ||
-        (data[9] != 0x00 && data[9] != 0x01))
+    if (data[1] < RADAR3D_MSG_ID_MIN || data[1] > RADAR3D_MSG_ID_MAX)
     {
         return -1;
     }
 
-    x_position = ((int32_t)data[2] << 16) | ((int32_t)data[3] << 8) | data[4];
-    y_position = ((int32_t)data[6] << 16) | ((int32_t)data[7] << 8) | data[8];
-    yaw_angle  = ((int32_t)data[10] << 16) | ((int32_t)data[11] << 8) | data[12];
+    x_position  = radar3d_get_int16_be(data[2],  data[3]);
+    y_position  = radar3d_get_int16_be(data[4],  data[5]);
+    z_position  = radar3d_get_int16_be(data[6],  data[7]);
+    roll_angle  = radar3d_get_int16_be(data[8],  data[9]);
+    pitch_angle = radar3d_get_int16_be(data[10], data[11]);
+    yaw_angle   = radar3d_get_int16_be(data[12], data[13]);
 
-    if (data[1] == 0x01)
-    {
-        x_position = -x_position;
-    }
-    if (data[5] == 0x01)
-    {
-        y_position = -y_position;
-    }
-    if (data[9] == 0x01)
-    {
-        yaw_angle = -yaw_angle;
-    }
+    g_radar3d_last_msg_id = data[1];
+    g_radar3d_last_x = x_position;
+    g_radar3d_last_y = y_position;
+    g_radar3d_last_z = z_position;
+    g_radar3d_last_roll = roll_angle;
+    g_radar3d_last_pitch = pitch_angle;
+    g_radar3d_last_yaw = yaw_angle;
 
-    yaw_slam = yaw_angle * 0.1f;
+    /*
+     * 保持原二维雷达代码中的坐标约定：
+     * 原代码将雷达x/y取反后写入 dis_x_slam/dis_y_slam，因此这里继续取反，
+     * 避免后续路径点、PID方向和set_dis_zero()逻辑整体反向。
+     * 新协议中的yaw已经是“度”，不再乘0.1。
+     */
     dis_x_slam = -x_position;
     dis_y_slam = -y_position;
+    yaw_slam = (float)yaw_angle;
 
     return 0;
 }
