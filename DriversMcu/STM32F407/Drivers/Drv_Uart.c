@@ -13,9 +13,9 @@
 
 void NoUse(u8 data) {}
 // ���ڽ��շ��Ϳ��ٶ��壬ֱ���޸Ĵ˴��ĺ������ƺ꣬�޸ĳ��Լ��Ĵ��ڽ����ͷ��ͺ������Ƽ��ɣ�ע�⺯��������ʽ��ͳһ
-#define U1GetOneByte MY_uart_esp_receive   // �ݶ�esp���ڣ���˫����
-#define U2GetOneByte MY_uart_radio_receive // �ݶ�Ϊ�״���������
-#define U3GetOneByte MY_uart_maixcam_receive  // �ݶ�mv��������
+#define U1GetOneByte MY_uart_esp_receive     // �ݶ�esp���ڣ���˫����
+#define U2GetOneByte MY_uart_radar_receive   // �ݶ�Ϊ�״���������
+#define U3GetOneByte MY_uart_maixcam_receive // �ݶ�mv��������
 #define U4GetOneByte AnoOF_GetOneByte
 #define U5GetOneByte ANO_DT_LX_Data_Receive_Prepare
 

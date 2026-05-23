@@ -4,56 +4,90 @@
 #include "my_send_test.h"
 #include "my_contrl.h"
 
-#define QR_CODE_A                 0xCA
-#define QR_CODE_B                 0xCB
-#define QR_CODE_C                 0xCC
+#define QR_CODE_A VISION_CODE_RED_X
+#define QR_CODE_B VISION_CODE_OLD_B
+#define QR_CODE_C VISION_CODE_OLD_C
+#define LINE_CODE VISION_CODE_LINE
 
-#define ESP_FRAME_HEAD            0xBB
-#define ESP_FRAME_ADDR            0x10
-#define ESP_FRAME_FIXED           0xF1
-#define ESP_FRAME_END             0xEE
+#define ESP_FRAME_HEAD 0xBB
+#define ESP_FRAME_ADDR 0x10
+#define ESP_FRAME_FIXED 0xF1
+#define ESP_FRAME_END 0xEE
 
-#define ESP_FUNC_MISSION_CMD      0x10
-#define ESP_FUNC_QR_TYPE          0x20
+#define ESP_FUNC_MISSION_CMD 0x10
+#define ESP_FUNC_QR_TYPE 0x20
 
-#define CAM_FRAME_HEAD            0xBB
-#define CAM_FRAME_END             0xFF
-#define CAM_CTRL_FC               0x50
-#define CAM_CTRL_CAM              0x60
+#define CAM_FRAME_HEAD 0xBB
+#define CAM_FRAME_END 0xFF
+#define CAM_CTRL_FC VISION_CTRL_RELEASE
+#define CAM_CTRL_CAM VISION_CTRL_RED
+#define CAM_CTRL_LINE VISION_CTRL_LINE
 
-#define RADAR3D_FRAME_HEAD        0xAA
-#define RADAR3D_FRAME_END         0x0A
-#define RADAR3D_FRAME_LEN         15
-#define RADAR3D_MSG_ID_MIN        0x01
-#define RADAR3D_MSG_ID_MAX        0x03
+#define RADAR3D_FRAME_HEAD 0xAA
+#define RADAR3D_FRAME_END 0x0A
+#define RADAR3D_FRAME_LEN 15
+#define RADAR3D_MSG_ID_MIN 0x01
+#define RADAR3D_MSG_ID_MAX 0x03
 
-int my_task_flag;                 /* 任务标志位，0表示空闲，1表示有任务 */
+int my_task_flag; /* 任务标志位，0表示空闲，1表示有任务 */
 uint8_t my_slam_flag = 0;
 int16_t OpenMV_data_0, OpenMV_data_1, OpenMV_data_2;
 
-/* 三维激光雷达原始数据缓存：单位与雷达协议一致，位置为cm，姿态角为度。 */
-volatile uint8_t g_radar3d_last_msg_id = 0;
-volatile int16_t g_radar3d_last_x = 0;
-volatile int16_t g_radar3d_last_y = 0;
-volatile int16_t g_radar3d_last_z = 0;
-volatile int16_t g_radar3d_last_roll = 0;
-volatile int16_t g_radar3d_last_pitch = 0;
-volatile int16_t g_radar3d_last_yaw = 0;
-
 volatile uint16_t g_maixcam_valid_frame_cnt = 0;
+volatile uint16_t g_maixcam_line_frame_cnt = 0;
+volatile uint16_t g_maixcam_red_frame_cnt = 0;
+volatile uint16_t g_maixcam_ctrl_frame_cnt = 0;
 volatile uint8_t g_maixcam_last_code = 0;
 volatile uint8_t g_maixcam_last_ctrl = CAM_CTRL_FC;
 volatile int16_t g_maixcam_last_x = 0;
 volatile int16_t g_maixcam_last_y = 0;
+
+volatile Vision_Frame_t latest_line_frame = {0};
+volatile Vision_Frame_t latest_red_frame = {0};
+volatile Vision_Frame_t latest_ctrl_frame = {0};
 
 static uint8_t is_valid_qr_type(uint8_t code)
 {
     return (code == QR_CODE_A || code == QR_CODE_B || code == QR_CODE_C) ? 1u : 0u;
 }
 
+static uint8_t is_valid_cam_code(uint8_t code)
+{
+    return (is_valid_qr_type(code) || code == LINE_CODE) ? 1u : 0u;
+}
+
 static uint8_t is_valid_cam_control(uint8_t control)
 {
-    return (control == CAM_CTRL_FC || control == CAM_CTRL_CAM) ? 1u : 0u;
+    return (control == CAM_CTRL_FC || control == CAM_CTRL_CAM || control == CAM_CTRL_LINE) ? 1u : 0u;
+}
+
+static uint8_t is_valid_cam_code_ctrl_pair(uint8_t code, uint8_t ctrl)
+{
+    if (code == LINE_CODE)
+    {
+        return (ctrl == CAM_CTRL_LINE) ? 1u : 0u;
+    }
+
+    if (is_valid_qr_type(code))
+    {
+        return (ctrl == CAM_CTRL_CAM || ctrl == CAM_CTRL_FC) ? 1u : 0u;
+    }
+
+    return 0;
+}
+
+static void save_vision_frame(volatile Vision_Frame_t *dst,
+                              uint8_t code,
+                              uint8_t ctrl,
+                              int16_t x_cm,
+                              int16_t y_cm)
+{
+    dst->code = code;
+    dst->ctrl = ctrl;
+    dst->x_cm = x_cm;
+    dst->y_cm = y_cm;
+    dst->last_update_ms = (uint32_t)g_maixcam_valid_frame_cnt * 20u;
+    dst->valid = 1;
 }
 
 void MY_uart_maixcam_clear_state(void)
@@ -63,8 +97,13 @@ void MY_uart_maixcam_clear_state(void)
     dis_y_cam_target = 0;
 
     g_maixcam_last_ctrl = CAM_CTRL_FC;
+    g_maixcam_last_code = 0;
     g_maixcam_last_x = 0;
     g_maixcam_last_y = 0;
+
+    latest_line_frame.valid = 0;
+    latest_red_frame.valid = 0;
+    latest_ctrl_frame.valid = 0;
 }
 
 /*
@@ -184,7 +223,7 @@ void MY_uart_esp_receive(uint8_t data)
         }
         else
         {
-            my_send_esp_1_test(0xDF);     /* 校验失败 */
+            my_send_esp_1_test(0xDF); /* 校验失败 */
         }
 
         rxstate = 0;
@@ -201,10 +240,7 @@ void MY_uart_esp_receive(uint8_t data)
 
 /* ESP32 -> 飞控：解析完整8字节帧
  * func=0x10：任务命令
- * func=0x20：地面站选择二维码类型。这里采用“立即转发 + 本地存储”的方案：
- *            1) cam_target_code_identity_flag 保存当前目标二维码；
- *            2) 立即通过 UART3 发送 BB code FF 给 MaixCam；
- *            3) 飞控任务函数后续只读取 cam_target_code_identity_flag，不再重复解析ESP帧。
+ * func=0x20：地面站选择目标类型。E题实际只使用红色× code=0xCA；0xCB/0xCC 保留兼容。
  */
 int MY_uart_esp_anl(uint8_t *data, uint8_t len)
 {
@@ -229,12 +265,18 @@ int MY_uart_esp_anl(uint8_t *data, uint8_t len)
     {
         switch (message)
         {
-        case 0x00: return 0;
-        case 0x01: return 1;
-        case 0x02: return 2;
-        case 0x03: return 3;
-        case 0x04: return 4;
-        default:   return -1;
+        case 0x00:
+            return 0;
+        case 0x01:
+            return 1;
+        case 0x02:
+            return 2;
+        case 0x03:
+            return 3;
+        case 0x04:
+            return 4;
+        default:
+            return -1;
         }
     }
     else if (func == ESP_FUNC_QR_TYPE)
@@ -250,111 +292,48 @@ int MY_uart_esp_anl(uint8_t *data, uint8_t len)
         dis_y_cam_target = 0;
 
         MY_uart_maixcam_send(message);
-        // if(message==QR_CODE_A)
-        // {
-        //     my_send_esp_qr_message(DEVICE_BROADCAST, message, -111, 222);
-        // }
-        // else if (message==QR_CODE_B)
-        // {
-        //     my_send_esp_qr_message(DEVICE_BROADCAST, message, -333, 444);
-        // }
-        // else if (message==QR_CODE_C)
-        // {
-        //     my_send_esp_qr_message(DEVICE_BROADCAST, message, -555, 666);
-        // }
         return 20;
     }
 
     return -1;
 }
 
-/* 三维激光雷达 -> 飞控：15字节帧
- * 波特率：115200，8N1
- * 格式：AA id xH xL yH yL zH zL rollH rollL pitchH pitchL yawH yawL 0A
- * 数据：X/Y/Z/roll/pitch/yaw 均为 int16，大端高字节在前。
- * 单位：X/Y/Z 为 cm，roll/pitch/yaw 为 °。
- * 示例：AA 01 00 64 FF CE 00 1E 00 0A FF FB 00 5A 0A
- *       x=100cm, y=-50cm, z=30cm, roll=10°, pitch=-5°, yaw=90°
- */
-void MY_uart_radio_receive(uint8_t data)
+/* ---------------- 雷达接收：新协议实现 ---------------- */
+void MY_uart_radar_receive(uint8_t data)
 {
-    static uint8_t rxstate = 0;
-    static uint8_t slam_datatemp[RADAR3D_FRAME_LEN];
-    static uint8_t data_index = 0;
-
-    /* 重同步：中途再次遇到帧头0xAA，认为新帧重新开始，避免丢字节后持续错位。 */
-    if (data == RADAR3D_FRAME_HEAD && rxstate != 0)
-    {
-        data_index = 0;
-        slam_datatemp[data_index++] = data;
-        rxstate = 1;
-        return;
-    }
+    static u8 rxstate = 0;
+    static u8 radar_buf[14]; // 14字节缓冲区
+    static u8 data_index = 0;
 
     switch (rxstate)
     {
-    case 0:
-        if (data == RADAR3D_FRAME_HEAD)
+    case 0: // 等待帧头 0xAA
+        if (data == 0xAA)
         {
-            data_index = 0;
-            slam_datatemp[data_index++] = data;
+            radar_buf[0] = data;
+            data_index = 1;
             rxstate = 1;
         }
         break;
 
-    case 1:
-        /* 消息ID：协议给出0x01/0x02/0x03，当前定位版通常只有0x01。 */
-        if (data >= RADAR3D_MSG_ID_MIN && data <= RADAR3D_MSG_ID_MAX)
+    case 1: // 接收剩余 13 个字节（索引 1~13）
+        radar_buf[data_index++] = data;
+        if (data_index >= 14)
         {
-            slam_datatemp[data_index++] = data;
-            rxstate = 2;
-        }
-        else
-        {
-            data_index = 0;
-            rxstate = 0;
-        }
-        break;
-
-    case 2:
-    case 3:
-    case 4:
-    case 5:
-    case 6:
-    case 7:
-    case 8:
-    case 9:
-    case 10:
-    case 11:
-    case 12:
-    case 13:
-        slam_datatemp[data_index++] = data;
-        rxstate++;
-        break;
-
-    case 14:
-        slam_datatemp[data_index++] = data;
-        if (data_index == RADAR3D_FRAME_LEN &&
-            slam_datatemp[0] == RADAR3D_FRAME_HEAD &&
-            slam_datatemp[14] == RADAR3D_FRAME_END)
-        {
-            if (MY_uart_radio_anl(slam_datatemp, RADAR3D_FRAME_LEN) == 0)
+            // 检查帧尾
+            if (radar_buf[0] == 0xAA && radar_buf[13] == 0x0A)
             {
+                MY_uart_radar_anl(radar_buf, 14);
                 my_slam_flag = 1;
             }
             else
             {
                 my_slam_flag = 0;
-                my_send_esp_1_test(0xDE);
+                my_send_esp_1_test(0xDE); // 帧错误反馈
             }
+            data_index = 0;
+            rxstate = 0;
         }
-        else
-        {
-            my_slam_flag = 0;
-            my_send_esp_1_test(0xDE);
-        }
-        data_index = 0;
-        rxstate = 0;
         break;
 
     default:
@@ -364,59 +343,28 @@ void MY_uart_radio_receive(uint8_t data)
     }
 }
 
-static int16_t radar3d_get_int16_be(uint8_t high, uint8_t low)
+int MY_uart_radar_anl(uint8_t *data, uint8_t len)
 {
-    return (int16_t)(((uint16_t)high << 8) | (uint16_t)low);
-}
-
-int MY_uart_radio_anl(uint8_t *data, uint8_t len)
-{
-    int16_t x_position;
-    int16_t y_position;
-    int16_t z_position;
-    int16_t roll_angle;
-    int16_t pitch_angle;
-    int16_t yaw_angle;
-
-    if (len != RADAR3D_FRAME_LEN)
+    if (len != 14 || data[0] != 0xAA || data[13] != 0x0A)
     {
         return -1;
     }
 
-    if (data[0] != RADAR3D_FRAME_HEAD || data[14] != RADAR3D_FRAME_END)
-    {
-        return -1;
-    }
+    // 按照大端序解析 int16（高字节在前，低字节在后）
+    int16_t x = (int16_t)((data[1] << 8) | data[2]);
+    int16_t y = (int16_t)((data[3] << 8) | data[4]);
+    int16_t z = (int16_t)((data[5] << 8) | data[6]);
+    // roll 和 pitch 可根据需要忽略，这里仅存储但不发送
+    // int16_t roll  = (int16_t)((data[7] << 8) | data[8]);
+    // int16_t pitch = (int16_t)((data[9] << 8) | data[10]);
+    int16_t yaw = (int16_t)((data[11] << 8) | data[12]);
 
-    if (data[1] < RADAR3D_MSG_ID_MIN || data[1] > RADAR3D_MSG_ID_MAX)
-    {
-        return -1;
-    }
+    (void)z;
 
-    x_position  = radar3d_get_int16_be(data[2],  data[3]);
-    y_position  = radar3d_get_int16_be(data[4],  data[5]);
-    z_position  = radar3d_get_int16_be(data[6],  data[7]);
-    roll_angle  = radar3d_get_int16_be(data[8],  data[9]);
-    pitch_angle = radar3d_get_int16_be(data[10], data[11]);
-    yaw_angle   = radar3d_get_int16_be(data[12], data[13]);
-
-    g_radar3d_last_msg_id = data[1];
-    g_radar3d_last_x = x_position;
-    g_radar3d_last_y = y_position;
-    g_radar3d_last_z = z_position;
-    g_radar3d_last_roll = roll_angle;
-    g_radar3d_last_pitch = pitch_angle;
-    g_radar3d_last_yaw = yaw_angle;
-
-    /*
-     * 保持原二维雷达代码中的坐标约定：
-     * 原代码将雷达x/y取反后写入 dis_x_slam/dis_y_slam，因此这里继续取反，
-     * 避免后续路径点、PID方向和set_dis_zero()逻辑整体反向。
-     * 新协议中的yaw已经是“度”，不再乘0.1。
-     */
-    dis_x_slam = -x_position;
-    dis_y_slam = -y_position;
-    yaw_slam = (float)yaw_angle;
+    // 更新全局变量
+    dis_x_slam = x;
+    dis_y_slam = y;
+    yaw_slam = yaw;
 
     return 0;
 }
@@ -494,7 +442,7 @@ void MY_uart_K230_send(uint8_t data)
     DrvUart3SendBuf(Buf, sizeof(Buf));
 }
 
-/* MaixCam -> 飞控：BB code control signX xH xL signY yH yL FF */
+/* MaixCam -> 飞控：BB code ctrl signX xH xL signY yH yL FF */
 void MY_uart_maixcam_receive(uint8_t data)
 {
     static uint8_t rxstate = 0;
@@ -574,19 +522,18 @@ int MY_uart_maixcam_anl(uint8_t *data, uint8_t len)
     code_type = data[1];
     control_bit = data[2];
 
-    if (!is_valid_qr_type(code_type) || !is_valid_cam_control(control_bit))
+    if (!is_valid_cam_code(code_type) || !is_valid_cam_control(control_bit))
+    {
+        return 0;
+    }
+
+    if (!is_valid_cam_code_ctrl_pair(code_type, control_bit))
     {
         return 0;
     }
 
     if ((data[3] != 0x00 && data[3] != 0x01) ||
         (data[6] != 0x00 && data[6] != 0x01))
-    {
-        return 0;
-    }
-
-    /* MaixCam理论上只会返回当前指定二维码。若返回码与地面站指定码不一致，忽略该帧，避免误切视觉控制。 */
-    if (is_valid_qr_type(cam_target_code_identity_flag) && code_type != cam_target_code_identity_flag)
     {
         return 0;
     }
@@ -603,26 +550,57 @@ int MY_uart_maixcam_anl(uint8_t *data, uint8_t len)
         y_position = -y_position;
     }
 
-    cam_target_control_flag = control_bit;
     g_maixcam_last_code = code_type;
     g_maixcam_last_ctrl = control_bit;
     g_maixcam_last_x = x_position;
     g_maixcam_last_y = y_position;
 
-    if (control_bit == CAM_CTRL_CAM)
+    /*
+     * 0xA1/0x61：黑线巡线辅助。只更新 latest_line_frame，不覆盖红色×控制变量，
+     * 否则巡线帧会把投掷状态机误触发或误释放。
+     */
+    if (code_type == LINE_CODE && control_bit == CAM_CTRL_LINE)
     {
+        save_vision_frame(&latest_line_frame, code_type, control_bit, x_position, y_position);
+        g_maixcam_line_frame_cnt++;
+        g_maixcam_valid_frame_cnt++;
+        return 1;
+    }
+
+    /* 红色×/兼容旧 code 的 0x60：末端引导偏差。 */
+    if (is_valid_qr_type(code_type) && control_bit == CAM_CTRL_CAM)
+    {
+        /* 如果地面站仍然选择 0xCB/0xCC，则兼容；E题默认目标是 0xCA。 */
+        if (is_valid_qr_type(cam_target_code_identity_flag) && code_type != cam_target_code_identity_flag)
+        {
+            return 0;
+        }
+
+        save_vision_frame(&latest_red_frame, code_type, control_bit, x_position, y_position);
+        cam_target_control_flag = CAM_CTRL_CAM;
         dis_x_cam_target = x_position;
         dis_y_cam_target = y_position;
+        g_maixcam_red_frame_cnt++;
+        g_maixcam_valid_frame_cnt++;
+        return 1;
     }
-    else
+
+    /* 红色×/兼容旧 code 的 0x50：只表示释放视觉控制；是否为投放完成由任务状态机判定。 */
+    if (is_valid_qr_type(code_type) && control_bit == CAM_CTRL_FC)
     {
-        /* 0x50：相机释放控制权。 */
+        if (is_valid_qr_type(cam_target_code_identity_flag) && code_type != cam_target_code_identity_flag)
+        {
+            return 0;
+        }
+
+        save_vision_frame(&latest_ctrl_frame, code_type, control_bit, x_position, y_position);
+        cam_target_control_flag = CAM_CTRL_FC;
         dis_x_cam_target = 0;
         dis_y_cam_target = 0;
+        g_maixcam_ctrl_frame_cnt++;
+        g_maixcam_valid_frame_cnt++;
+        return 1;
     }
 
-    /* 只要是一帧合法MaixCam数据，就递增计数，供任务层判断数据是否持续刷新。 */
-    g_maixcam_valid_frame_cnt++;
-
-    return 1;
+    return 0;
 }

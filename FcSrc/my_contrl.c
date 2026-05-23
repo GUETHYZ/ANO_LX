@@ -26,6 +26,35 @@ uint8_t yaw_mode = YAW_MODE_HOLD_ABS;
 int dis_x_cam_target, dis_y_cam_target;
 uint8_t cam_target_control_flag, cam_target_code_identity_flag;
 
+volatile uint8_t vision_assist_mode = VISION_ASSIST_NONE;
+volatile int32_t vision_line_y_cm = 0;
+volatile int32_t vision_red_x_cm = 0;
+volatile int32_t vision_red_y_cm = 0;
+
+void vision_control_set_none(void)
+{
+    vision_assist_mode = VISION_ASSIST_NONE;
+    vision_line_y_cm = 0;
+    vision_red_x_cm = 0;
+    vision_red_y_cm = 0;
+}
+
+void vision_control_set_line(int32_t line_y_cm)
+{
+    vision_line_y_cm = line_y_cm;
+    vision_red_x_cm = 0;
+    vision_red_y_cm = 0;
+    vision_assist_mode = VISION_ASSIST_LINE;
+}
+
+void vision_control_set_red(int32_t red_x_cm, int32_t red_y_cm)
+{
+    vision_line_y_cm = 0;
+    vision_red_x_cm = red_x_cm;
+    vision_red_y_cm = red_y_cm;
+    vision_assist_mode = VISION_ASSIST_RED;
+}
+
 void mode_select(int mode)
 {
     keep_hight_flag = 0;

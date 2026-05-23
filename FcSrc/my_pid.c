@@ -3,20 +3,27 @@
 #include "my_get_data.h"
 #include "Ano_Math.h"
 
-
 double KP_xy = 1, KI_xy = 0, KD_xy = 0, intrgrate_max = 30;
 
 double KP_radar = 0.45, KI_radar = 0, KD_radar = 0.05;
 
 double KP_MV = 0.6, KI_MV = 0, KD_MV = 0;
 // 视觉联调单独给前后/左右两个轴留调参入口。
-double KP_MV_X = 0.2;
-double KP_MV_Y = 0.2;
+double KP_MV_X = 0.4;
+double KP_MV_Y = 0.4;
 
 /* 视觉位置环 D 项：先从小值开始 */
 double KD_MV_X = 0.08;
 double KD_MV_Y = 0.08;
 
+/* E题视觉辅助融合参数：
+ * - 黑线只做横向 y 修正，不直接控制前进速度；
+ * - 红色×末端引导优先级最高，x/y 两轴直接转换为机体系速度修正；
+ * - 如果实机方向相反，只改 LINE_Y_SIGN / RED_X_SIGN / RED_Y_SIGN。
+ */
+double KP_LINE_Y = 0.65;
+double KP_RED_X = 0.5;
+double KP_RED_Y = 0.5;
 
 double KP_yaw = 2.0;
 int32_t yaw_deadband = 1;
@@ -38,6 +45,16 @@ int32_t g_xy_limit_mv = 15;
 #define CAM_X_LIMIT_CMPS 20
 #define CAM_Y_LIMIT_CMPS 18
 
+#define LINE_Y_SIGN 1
+#define RED_X_SIGN 1
+#define RED_Y_SIGN 1
+#define LINE_Y_DEADBAND_CM 2
+#define RED_X_DEADBAND_CM 2
+#define RED_Y_DEADBAND_CM 2
+#define LINE_VY_LIMIT_CMPS 25
+#define RED_VEL_LIMIT_CMPS 15
+#define VISION_VEL_FILTER_DIV 4
+
 static int32_t abs_i32_pid(int32_t x)
 {
     return (x >= 0) ? x : -x;
@@ -54,6 +71,23 @@ int Limit_max_int(int input, int max)
         input = -max;
     }
     return input;
+}
+
+static int32_t calc_axis_vision_vel(int32_t err_cm,
+                                    int32_t sign,
+                                    double kp,
+                                    int32_t deadband_cm,
+                                    int32_t limit_cmps)
+{
+    int32_t out;
+
+    if (abs_i32_pid(err_cm) <= deadband_cm)
+    {
+        return 0;
+    }
+
+    out = (int32_t)(kp * (double)(sign * err_cm));
+    return Limit_max_int(out, limit_cmps);
 }
 
 static int32_t clamp_limit(int32_t limit)
@@ -152,7 +186,6 @@ static void calc_dis_vel(double KP,
     *out_vx = Limit_max_int(cal_vel_x, max);
     *out_vy = Limit_max_int(cal_vel_y, max);
 }
-
 
 static void calc_cam_vel(int32_t cam_x,
                          int32_t cam_y,
@@ -303,6 +336,10 @@ void PID(void)
     int32_t next_vel_z = 0;
     int32_t next_vel_yaw = 0;
 
+    static int32_t line_vy_filt = 0;
+    static int32_t red_vx_filt = 0;
+    static int32_t red_vy_filt = 0;
+
     if (keep_hight_flag)
     {
         next_vel_z = calc_hight_vel(height_target, hight);
@@ -342,14 +379,65 @@ void PID(void)
 
     if (keep_cam_flag)
     {
-        /* 视觉跟随改为分轴控制，避免某一轴误差过大时影响另一轴响应，
-         * 同时方便单独调大前后方向增益。
-         */
+        /* 兼容旧视觉模式。E题主流程使用 radar + vision_assist_mode 融合。 */
         calc_cam_vel(dis_x_cam_target,
                      dis_y_cam_target,
                      g_xy_limit_mv,
                      &next_vel_x,
                      &next_vel_y);
+    }
+
+    /*
+     * E题视觉融合统一出口：
+     * 1. VISION_ASSIST_LINE：黑线只叠加 y 方向横向速度修正；
+     * 2. VISION_ASSIST_RED：红色×末端引导优先级最高，叠加 x/y 两轴视觉速度；
+     * 3. 任务层超时后会切回 NONE，这里同时清空滤波残留，避免沿旧偏差继续飞。
+     */
+    if (vision_assist_mode == VISION_ASSIST_LINE)
+    {
+        int32_t raw_line_vy;
+
+        raw_line_vy = calc_axis_vision_vel((int32_t)vision_line_y_cm,
+                                           LINE_Y_SIGN,
+                                           KP_LINE_Y,
+                                           LINE_Y_DEADBAND_CM,
+                                           LINE_VY_LIMIT_CMPS);
+        line_vy_filt += (raw_line_vy - line_vy_filt) / VISION_VEL_FILTER_DIV;
+
+        next_vel_y = Limit_max_int(next_vel_y + line_vy_filt, g_xy_limit_radar);
+
+        red_vx_filt = 0;
+        red_vy_filt = 0;
+    }
+    else if (vision_assist_mode == VISION_ASSIST_RED)
+    {
+        int32_t raw_red_vx;
+        int32_t raw_red_vy;
+
+        raw_red_vx = calc_axis_vision_vel((int32_t)vision_red_x_cm,
+                                          RED_X_SIGN,
+                                          KP_RED_X,
+                                          RED_X_DEADBAND_CM,
+                                          RED_VEL_LIMIT_CMPS);
+        raw_red_vy = calc_axis_vision_vel((int32_t)vision_red_y_cm,
+                                          RED_Y_SIGN,
+                                          KP_RED_Y,
+                                          RED_Y_DEADBAND_CM,
+                                          RED_VEL_LIMIT_CMPS);
+
+        red_vx_filt += (raw_red_vx - red_vx_filt) / VISION_VEL_FILTER_DIV;
+        red_vy_filt += (raw_red_vy - red_vy_filt) / VISION_VEL_FILTER_DIV;
+
+        next_vel_x = Limit_max_int(next_vel_x + red_vx_filt, g_xy_limit_radar);
+        next_vel_y = Limit_max_int(next_vel_y + red_vy_filt, g_xy_limit_radar);
+
+        line_vy_filt = 0;
+    }
+    else
+    {
+        line_vy_filt = 0;
+        red_vx_filt = 0;
+        red_vy_filt = 0;
     }
 
     if (keep_yaw_flag)

@@ -22,6 +22,15 @@ extern uint8_t yaw_mode;
 extern int dis_x_cam_target, dis_y_cam_target;
 extern uint8_t cam_target_control_flag, cam_target_code_identity_flag;
 
+#define VISION_ASSIST_NONE 0
+#define VISION_ASSIST_LINE 1
+#define VISION_ASSIST_RED  2
+
+extern volatile uint8_t vision_assist_mode;
+extern volatile int32_t vision_line_y_cm;
+extern volatile int32_t vision_red_x_cm;
+extern volatile int32_t vision_red_y_cm;
+
 #define cam_target_control_flag_on 1
 #define cam_target_control_flag_off 0
 
@@ -34,6 +43,11 @@ void set_dis_zero(void);
 int32_t get_corrected_dis_x(int32_t dis_x);
 int32_t get_corrected_dis_y(int32_t dis_y);
 void dis_target_select(int dis_target_num);
+
+// 视觉辅助控制接口：任务层只写入当前允许生效的视觉修正，PID 层统一融合后一次性输出速度。
+void vision_control_set_none(void);
+void vision_control_set_line(int32_t line_y_cm);
+void vision_control_set_red(int32_t red_x_cm, int32_t red_y_cm);
 
 // yaw控制接口
 void yaw_set_hold_target(int32_t target_deg);

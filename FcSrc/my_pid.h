@@ -6,6 +6,9 @@
 extern int32_t g_xy_limit_optical;
 extern int32_t g_xy_limit_radar;
 extern int32_t g_xy_limit_mv;
+extern double KP_LINE_Y;
+extern double KP_RED_X;
+extern double KP_RED_Y;
 
 int Limit_max_int(int input, int max);
 void keep_hight(int32_t hight_target, int32_t hight);

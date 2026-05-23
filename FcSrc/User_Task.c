@@ -10,46 +10,48 @@
 #include "my_pid.h"
 
 /*
- * 低空无人机智慧救援：最终联调任务版
+ * 校电赛 E 题：红色×投掷区视觉末端引导任务版
  *
- * 已融合：
- * 1. CH6 高位启动任务，CH6 中位一键安全降落；
- * 2. 地面站选择二维码后，飞控读取 cam_target_code_identity_flag，并持续转发给 MaixCam；
- * 3. 起飞、雷达定点、建图悬停、随机航线全图巡航；
- * 4. MaixCam 输出 0x60 后，提前结束巡航，进入“雷达主控 + 相机偏差修正目标点”；
- * 5. 二维码上方稳定停留至少 2s，等待相机舵机投放完成并输出 0x50；
- * 6. 使用 my_send_esp_qr_message() 广播二维码类别和坐标；
- * 7. 返航到起点并自动降落。
+ * 分工原则：
+ * 1. 飞控只负责飞行控制、雷达航点、定高、定航向、继续航点飞行和最终降落；
+ * 2. MaixCam Pro 负责红色×识别、中心保持计时、舵机投放；
+ * 3. 飞控收到 MaixCam 的 0x60 后，进入“雷达主控 + 相机偏差修正目标点”；
+ * 4. 飞控不直接驱动舵机，也不自行判定投放完成；
+ * 5. 只有在“已经进入红色×末端引导 + 曾经稳定收到 0x60 + 相机稳定回发 0x50”后，
+ *    才认为相机端已经完成投放并释放控制权；
+ * 6. 投放完成后不返航到起点，而是回到原航线继续执行剩余航点，
+ *    到达最后一个航点后自动降落。
  *
  * 坐标约定：
  * - 以起飞区中心为原点，单位 cm；
- * - x/y 使用你航点测试中已经验证的雷达任务坐标；
- * - 上报坐标取二维码中心估计坐标，并限制在安全地图范围内。
+ * - 机头方向为 x 正方向；
+ * - 机头左侧为 y 正方向，因此向机头右侧飞通常对应 y 变小；
+ * - yaw 全程保持 0，不跟随地面线转弯。
  */
 
 #define TASK_PERIOD_MS 20
 
 /* 高度：最终联调先保持与稳定版本接近。若需要投放前下降，优先只改 DROP_HEIGHT_CM。 */
-#define TAKEOFF_HEIGHT_CM 150
+#define TAKEOFF_HEIGHT_CM 80
 #define SEARCH_HEIGHT_CM TAKEOFF_HEIGHT_CM
 #define DROP_HEIGHT_CM TAKEOFF_HEIGHT_CM
 
 #define HEIGHT_ARRIVE_TH_CM 10
-#define POS_ARRIVE_TH_CM 10
+#define POS_ARRIVE_TH_CM 5
 #define HOME_ARRIVE_TH_CM 5
 #define YAW_ARRIVE_TH_DEG 3.0f
 
 /* 速度上限。最后实机时建议先保持保守，确认稳定后再小幅提高 CRUISE/RETURN。 */
-#define CRUISE_SPEED_LIMIT_CMPS 12
-#define RETURN_SPEED_LIMIT_CMPS 12
+#define CRUISE_SPEED_LIMIT_CMPS 20
+#define RETURN_SPEED_LIMIT_CMPS 20 /* 保留名字兼容旧语义；本版用于终点段速度。 */
 #define RADAR_HOLD_SPEED_LIMIT_CMPS 12
 #define CAMERA_TRACK_SPEED_LIMIT_CMPS 15
 
 #define TAKEOFF_STABLE_CNT 25  /* 500ms */
 #define WAYPOINT_STABLE_CNT 10 /* 200ms */
 #define HOME_STABLE_CNT 30     /* 600ms */
-#define WAYPOINT_HOLD_MS 1500
-#define MAP_BUILD_HOLD_MS 6000
+#define WAYPOINT_HOLD_MS 1000
+#define MAP_BUILD_HOLD_MS 3000
 #define HOME_HOLD_BEFORE_LAND_MS 1500
 
 #define CH_SWITCH_HIGH_TH 1700
@@ -61,29 +63,59 @@
 #define CAMERA_TRIGGER_NEED_CH7 0
 #define CAMERA_CH_INDEX ch_7_aux3
 
-#define QR_CODE_A 0xCA
-#define QR_CODE_B 0xCB
-#define QR_CODE_C 0xCC
-#define QR_CODE_DEFAULT QR_CODE_A
+#define TARGET_RED_X 0xCA
+#define TARGET_UNUSED_B 0xCB
+#define TARGET_UNUSED_C 0xCC
+#define TARGET_CODE_DEFAULT TARGET_RED_X
 
 #define CAMERA_CTRL_FC 0x50
 #define CAMERA_CTRL_CAM 0x60
+#define CAMERA_CTRL_LINE 0x61
+#define TARGET_BLACK_LINE 0xA1
 
 /* 相机偏差处理：采用整数 13/10，相当于 1.3 倍。若出现追过头，先降到 10/10。 */
-#define CAM_POS_SCALE_NUM 14
+#define CAM_POS_SCALE_NUM 12
 #define CAM_POS_SCALE_DEN 10
 
 #define CAM_RAW_ABS_LIMIT_CM 150
 #define CAM_USED_ABS_LIMIT_CM 240
 #define CAM_CENTER_RAW_TH_CM 6
 #define CAM_LOST_HOLD_MS 1000
-#define CAM_CENTER_LOST_GRACE_MS 300  /* 视觉短时丢帧/误发 0x50 时，中心保持计时的容错窗口 */
-#define CAMERA_RELEASE_CONFIRM_MS 400 /* 投放完成 0x50 需要稳定持续一段时间才确认释放 */
-#define QR_TARGET_FILTER_DIV 4
-#define QR_TARGET_MAX_STEP_CM 10
+#define CAM_CENTER_LOST_GRACE_MS 300  /* 保留兼容旧变量，本版不再用飞控中心停留判定投放 */
+#define CAMERA_RELEASE_CONFIRM_MS 400 /* 保留兼容旧变量，本版改用 DROP_FINISH_CONFIRM_FRAMES */
+#define TARGET_FILTER_DIV 4
+#define TARGET_MAX_STEP_CM 10
+
+#define LINE_TIMEOUT_MS 400
+#define RED_GUIDE_TIMEOUT_MS 500
+#define RED_ENTER_CONFIRM_FRAMES 3
+#define DROP_FINISH_CONFIRM_FRAMES 6
+#define VISION_TASK_FILTER_DIV 4
+
+/*
+ * 投放完成后的航点恢复策略。
+ * 注意：当前 route_0 实际只有 5 个点：
+ *   index 0 = (160, 0)
+ *   index 1 = (160, -80)
+ *   index 2 = (160, -160)
+ *   index 3 = (160, -160)
+ *   index 4 = (0, -160)
+ * 之前把恢复点写成 index 7 会越界，导致状态机直接进入 STEP_ROUTE_END_GOTO，
+ * 表现为投放后直接飞到最后一个点 (0, -160)。
+ *
+ * 本版采用“按坐标寻找恢复点”的方式：投放后优先飞向 (160, -160)，
+ * 如果路线中有重复点，选择最后一个匹配点，即当前 route_0 的 index 3。
+ */
+#define DROP_RESUME_WP_AUTO 0xFF
+#define DROP_RESUME_BY_COORD 0xFE
+#define ROUTE0_DROP_DONE_RESUME_WP_INDEX DROP_RESUME_BY_COORD
+#define ROUTE1_DROP_DONE_RESUME_WP_INDEX DROP_RESUME_WP_AUTO
+#define ROUTE2_DROP_DONE_RESUME_WP_INDEX DROP_RESUME_WP_AUTO
+#define ROUTE0_DROP_RESUME_X_CM 160
+#define ROUTE0_DROP_RESUME_Y_CM (-160)
 
 /* 投放与上报 */
-#define QR_CENTER_HOLD_MIN_MS 2200 /* 规则要求 2s 以上，这里留 200ms 裕量 */
+#define TARGET_CENTER_HOLD_MIN_MS 3000 /* 题目要求投掷区上方悬停 3s 以上，投放由相机端舵机触发。 */
 #define CAMERA_APPROACH_TIMEOUT_MS 25000
 #define REPORT_REPEAT_COUNT 8
 #define REPORT_REPEAT_INTERVAL_MS 100
@@ -91,7 +123,7 @@
 /* 依据你实测的安全地图范围：x 最大 240~250，y 最大 300。 */
 #define MAP_FLY_X_MIN_CM 0
 #define MAP_FLY_X_MAX_CM 240
-#define MAP_FLY_Y_MIN_CM 0
+#define MAP_FLY_Y_MIN_CM -300
 #define MAP_FLY_Y_MAX_CM 300
 
 #define STEP_IDLE 0
@@ -104,13 +136,13 @@
 #define STEP_WAYPOINT_HOLD 7
 #define STEP_CAMERA_APPROACH 8
 #define STEP_REPORT_RESULT 9
-#define STEP_RETURN_HOME 10
-#define STEP_HOME_HOLD 11
+#define STEP_ROUTE_END_GOTO 10
+#define STEP_ROUTE_END_HOLD 11
 #define STEP_AUTO_LAND 12
 #define STEP_FINISH 13
 
-/* ROUTE_FORCE_ID = 0/1/2 强制固定路线；=255 启用伪随机。 */
-#define ROUTE_FORCE_ID 255
+/* ROUTE_FORCE_ID = 0/1/2 强制固定路线；=255 启用伪随机。初测建议固定 0，避免随机路线影响排查。 */
+#define ROUTE_FORCE_ID 0
 
 extern int my_task_flag;
 extern uint8_t my_slam_flag;
@@ -121,43 +153,40 @@ typedef struct
     int16_t y;
 } waypoint_t;
 
-/* 航线 0：横向 S 型扫描，覆盖下、中、上三层。 */
+/* 航线 0：按照“先前飞、再右飞、最后后飞”的 yaw 固定路线。
+ * 坐标约定：x 正=机头前方，y 正=机头左侧，因此“向右飞”通常是 y 变小。
+ * 下面只是初始测试航点，实际比赛应按雷达坐标系重新量尺修正。
+ */
 static const waypoint_t route_0[] =
     {
-        {60, 60},
-        {120, 60},
-        {220, 60},
-        {220, 120},
-        {220, 150},
-        {120, 150},
-        {60, 150},
-        {60, 240},
-        {120, 240},
-        {220, 240},
-        {220, 300},
-        {120, 300}};
+        {160, 0},
+        {160, -78},
+        {160, -160},
+        {0, -160}};
 
-/* 航线 1：纵向条带扫描，适合从左到右覆盖。 */
+/* 航线 1：更保守的短路径，用于低速调试。 */
 static const waypoint_t route_1[] =
     {
-        {70, 60},
-        {70, 300},
-        {160, 300},
-        {160, 60},
-        {170, 60},
-        {190, 60},
-        {220, 60},
-        {220, 300}};
+        {40, 0},
+        {80, 0},
+        {120, 0},
+        {120, -40},
+        {120, -80},
+        {80, -80},
+        {40, -80}};
 
-/* 航线 2：斜向折线扫描，减少重复路径并覆盖三个二维码可能区域。 */
+/* 航线 2：备用覆盖路线。 */
 static const waypoint_t route_2[] =
     {
-        {60, 80},
-        {220, 120},
-        {70, 190},
-        {220, 250},
-        {130, 300},
-        {60, 260}};
+        {50, 0},
+        {100, 0},
+        {150, 0},
+        {150, -60},
+        {100, -60},
+        {50, -60},
+        {50, -120},
+        {100, -120},
+        {150, -120}};
 
 #define ROUTE_0_LEN ((uint8_t)(sizeof(route_0) / sizeof(route_0[0])))
 #define ROUTE_1_LEN ((uint8_t)(sizeof(route_1) / sizeof(route_1[0])))
@@ -172,9 +201,11 @@ static uint8_t s_auto_land_cmd_latch = 0;
 
 static uint8_t s_route_id = 0;
 static uint8_t s_wp_index = 0;
+static uint8_t s_resume_wp_index = 0;
+static uint8_t s_drop_done = 0;
 static uint16_t s_stable_cnt = 0;
 
-static uint8_t s_target_qr_code = QR_CODE_DEFAULT;
+static uint8_t s_target_code = TARGET_CODE_DEFAULT;
 static uint16_t s_cam_last_frame_cnt = 0;
 static uint16_t s_cam_lost_ms = 0;
 static uint16_t s_camera_phase_ms = 0;
@@ -187,11 +218,24 @@ static uint8_t s_last_center_sample_ok = 0;
 static uint16_t s_center_lost_ms = 0;
 static uint16_t s_release_candidate_ms = 0;
 
-static uint8_t s_qr_target_valid = 0;
-static int32_t s_qr_target_filt_x = 0;
-static int32_t s_qr_target_filt_y = 0;
-static int16_t s_qr_report_x = 0;
-static int16_t s_qr_report_y = 0;
+static uint16_t s_line_last_frame_cnt = 0;
+static uint16_t s_red_last_frame_cnt = 0;
+static uint16_t s_ctrl_last_frame_cnt = 0;
+static uint16_t s_line_lost_ms = 0;
+static uint16_t s_red_lost_ms = 0;
+static uint8_t s_red_enter_valid_count = 0;
+static uint8_t s_red_valid_count = 0;
+static uint8_t s_drop_finish_count = 0;
+static uint8_t s_red_timeout_reported = 0;
+static int32_t s_line_y_filt = 0;
+static int32_t s_red_x_filt = 0;
+static int32_t s_red_y_filt = 0;
+
+static uint8_t s_target_valid = 0;
+static int32_t s_target_filt_x = 0;
+static int32_t s_target_filt_y = 0;
+static int16_t s_target_report_x = 0;
+static int16_t s_target_report_y = 0;
 
 static uint8_t s_report_repeat_cnt = 0;
 static uint16_t s_report_interval_ms = 0;
@@ -230,9 +274,9 @@ static int32_t step_to_i32(int32_t cur, int32_t target, int32_t max_step)
     return target;
 }
 
-static uint8_t is_valid_qr_type_local(uint8_t code)
+static uint8_t is_valid_target_code_local(uint8_t code)
 {
-    return (code == QR_CODE_A || code == QR_CODE_B || code == QR_CODE_C) ? 1u : 0u;
+    return (code == TARGET_RED_X || code == TARGET_UNUSED_B || code == TARGET_UNUSED_C) ? 1u : 0u;
 }
 
 static uint8_t step_entered(void)
@@ -371,6 +415,90 @@ static waypoint_t get_waypoint(uint8_t route_id, uint8_t index)
     return p;
 }
 
+static waypoint_t get_last_waypoint(uint8_t route_id)
+{
+    uint8_t len = get_route_len(route_id);
+
+    if (len == 0)
+    {
+        waypoint_t p = {0, 0};
+        return p;
+    }
+
+    return get_waypoint(route_id, (uint8_t)(len - 1));
+}
+
+static uint8_t find_last_waypoint_index_by_xy(uint8_t route_id, int16_t x, int16_t y)
+{
+    uint8_t i;
+    uint8_t len = get_route_len(route_id);
+    uint8_t found = DROP_RESUME_WP_AUTO;
+
+    for (i = 0; i < len; i++)
+    {
+        waypoint_t p = get_waypoint(route_id, i);
+        if (p.x == x && p.y == y)
+        {
+            /* 如果存在重复航点，保留最后一个匹配点，避免在同一坐标重复悬停太久。 */
+            found = i;
+        }
+    }
+
+    return found;
+}
+
+static uint8_t get_drop_done_resume_wp_index(void)
+{
+    uint8_t len = get_route_len(s_route_id);
+    uint8_t resume = s_resume_wp_index;
+
+    if (len == 0)
+    {
+        return 0;
+    }
+
+    /* route_0：投放完成后明确飞向 (160, -160)，不要再使用旧的 index 7。 */
+    if (s_route_id == 0)
+    {
+        if (ROUTE0_DROP_DONE_RESUME_WP_INDEX == DROP_RESUME_BY_COORD)
+        {
+            uint8_t idx = find_last_waypoint_index_by_xy(s_route_id,
+                                                         ROUTE0_DROP_RESUME_X_CM,
+                                                         ROUTE0_DROP_RESUME_Y_CM);
+            if (idx != DROP_RESUME_WP_AUTO)
+            {
+                resume = idx;
+            }
+        }
+        else if (ROUTE0_DROP_DONE_RESUME_WP_INDEX != DROP_RESUME_WP_AUTO)
+        {
+            resume = ROUTE0_DROP_DONE_RESUME_WP_INDEX;
+        }
+    }
+    else if (s_route_id == 1 && ROUTE1_DROP_DONE_RESUME_WP_INDEX != DROP_RESUME_WP_AUTO)
+    {
+        resume = ROUTE1_DROP_DONE_RESUME_WP_INDEX;
+    }
+    else if (s_route_id == 2 && ROUTE2_DROP_DONE_RESUME_WP_INDEX != DROP_RESUME_WP_AUTO)
+    {
+        resume = ROUTE2_DROP_DONE_RESUME_WP_INDEX;
+    }
+
+    /* 关键保护：恢复点不能等于/超过 len，否则会直接进入 STEP_ROUTE_END_GOTO。 */
+    if (resume >= len)
+    {
+        resume = (uint8_t)(len - 1);
+    }
+
+    return resume;
+}
+
+static void enter_camera_approach_from_route(uint8_t resume_wp_index)
+{
+    s_resume_wp_index = resume_wp_index;
+    mission_step = STEP_CAMERA_APPROACH;
+}
+
 static uint8_t select_route_id(void)
 {
 #if (ROUTE_FORCE_ID == 0)
@@ -408,6 +536,8 @@ static void reset_rescue_task_state(void)
 
     s_route_id = 0;
     s_wp_index = 0;
+    s_resume_wp_index = 0;
+    s_drop_done = 0;
     s_stable_cnt = 0;
 
     s_cam_last_frame_cnt = g_maixcam_valid_frame_cnt;
@@ -422,11 +552,25 @@ static void reset_rescue_task_state(void)
     s_center_lost_ms = 0;
     s_release_candidate_ms = 0;
 
-    s_qr_target_valid = 0;
-    s_qr_target_filt_x = 0;
-    s_qr_target_filt_y = 0;
-    s_qr_report_x = 0;
-    s_qr_report_y = 0;
+    s_line_last_frame_cnt = g_maixcam_line_frame_cnt;
+    s_red_last_frame_cnt = g_maixcam_red_frame_cnt;
+    s_ctrl_last_frame_cnt = g_maixcam_ctrl_frame_cnt;
+    s_line_lost_ms = LINE_TIMEOUT_MS + TASK_PERIOD_MS;
+    s_red_lost_ms = RED_GUIDE_TIMEOUT_MS + TASK_PERIOD_MS;
+    s_red_enter_valid_count = 0;
+    s_red_valid_count = 0;
+    s_drop_finish_count = 0;
+    s_red_timeout_reported = 0;
+    s_line_y_filt = 0;
+    s_red_x_filt = 0;
+    s_red_y_filt = 0;
+    vision_control_set_none();
+
+    s_target_valid = 0;
+    s_target_filt_x = 0;
+    s_target_filt_y = 0;
+    s_target_report_x = 0;
+    s_target_report_y = 0;
 
     s_report_repeat_cnt = 0;
     s_report_interval_ms = 0;
@@ -436,20 +580,19 @@ static void reset_rescue_task_state(void)
     mission_step = STEP_IDLE;
 }
 
-static uint8_t current_selected_qr_code(void)
+static uint8_t current_selected_target_code(void)
 {
-    if (is_valid_qr_type_local(cam_target_code_identity_flag))
-    {
-        return cam_target_code_identity_flag;
-    }
-    return QR_CODE_DEFAULT;
+    /* 本题只有一个红色×投掷区，不再依赖地面站选择目标类型。
+     * 仍然使用 0xCA，是为了兼容 my_uart.c 中已有的合法 code 判断。
+     */
+    return TARGET_CODE_DEFAULT;
 }
 
-static void send_qr_to_camera_periodically(uint16_t period_ms)
+static void send_target_to_camera_periodically(uint16_t period_ms)
 {
     if (s_camera_resend_ms == 0)
     {
-        MY_uart_maixcam_send(s_target_qr_code);
+        MY_uart_maixcam_send(s_target_code);
     }
 
     s_camera_resend_ms += TASK_PERIOD_MS;
@@ -473,24 +616,105 @@ static uint8_t maixcam_has_new_frame(void)
 
 static uint8_t camera_code_matches_target(void)
 {
-    return (g_maixcam_last_code == s_target_qr_code) ? 1u : 0u;
+    return (g_maixcam_last_code == s_target_code) ? 1u : 0u;
 }
 
 static uint8_t camera_triggered_target(void)
 {
-    if (!camera_gate_open())
+    Vision_Frame_t red_frame;
+
+    if (s_drop_done)
     {
         return 0;
     }
 
-    if (cam_target_control_flag == CAMERA_CTRL_CAM &&
-        g_maixcam_last_ctrl == CAMERA_CTRL_CAM &&
-        camera_code_matches_target())
+    if (!camera_gate_open())
     {
+        s_red_enter_valid_count = 0;
+        return 0;
+    }
+
+    if (g_maixcam_red_frame_cnt != s_red_last_frame_cnt)
+    {
+        s_red_last_frame_cnt = g_maixcam_red_frame_cnt;
+        red_frame = latest_red_frame;
+
+        if (red_frame.valid && red_frame.code == s_target_code && red_frame.ctrl == CAMERA_CTRL_CAM)
+        {
+            if (s_red_enter_valid_count < 255)
+            {
+                s_red_enter_valid_count++;
+            }
+        }
+    }
+
+    /* 如果巡航阶段持续收到 0x50，说明相机还没锁定红色×，不能触发投放状态。 */
+    if (g_maixcam_ctrl_frame_cnt != s_ctrl_last_frame_cnt)
+    {
+        Vision_Frame_t ctrl_frame = latest_ctrl_frame;
+        s_ctrl_last_frame_cnt = g_maixcam_ctrl_frame_cnt;
+        if (ctrl_frame.valid && ctrl_frame.code == s_target_code && ctrl_frame.ctrl == CAMERA_CTRL_FC)
+        {
+            s_red_enter_valid_count = 0;
+        }
+    }
+
+    if (s_red_enter_valid_count >= RED_ENTER_CONFIRM_FRAMES)
+    {
+        s_red_enter_valid_count = 0;
         return 1;
     }
 
     return 0;
+}
+
+static void update_line_assist_for_cruise(void)
+{
+    Vision_Frame_t line_frame;
+
+    if (g_maixcam_line_frame_cnt != s_line_last_frame_cnt)
+    {
+        s_line_last_frame_cnt = g_maixcam_line_frame_cnt;
+        line_frame = latest_line_frame;
+
+        if (line_frame.valid && line_frame.code == TARGET_BLACK_LINE && line_frame.ctrl == CAMERA_CTRL_LINE)
+        {
+            if (s_line_lost_ms > LINE_TIMEOUT_MS)
+            {
+                s_line_y_filt = line_frame.y_cm;
+            }
+            else
+            {
+                s_line_y_filt += ((int32_t)line_frame.y_cm - s_line_y_filt) / VISION_TASK_FILTER_DIV;
+            }
+            s_line_lost_ms = 0;
+        }
+    }
+    else
+    {
+        if (s_line_lost_ms < 60000)
+        {
+            s_line_lost_ms += TASK_PERIOD_MS;
+        }
+    }
+
+    if (s_line_lost_ms <= LINE_TIMEOUT_MS)
+    {
+        vision_control_set_line(s_line_y_filt);
+    }
+    else
+    {
+        vision_control_set_none();
+        s_line_y_filt = 0;
+    }
+}
+
+static void disable_line_assist(void)
+{
+    if (vision_assist_mode == VISION_ASSIST_LINE)
+    {
+        vision_control_set_none();
+    }
 }
 
 static int32_t scale_cam_pos(int32_t v)
@@ -511,7 +735,7 @@ static uint8_t camera_sample_valid(int32_t cam_x, int32_t cam_y)
     return 1;
 }
 
-static void update_qr_target_by_camera_sample(int32_t cam_x_raw, int32_t cam_y_raw)
+static void update_red_x_target_by_camera_sample(int32_t cam_x_raw, int32_t cam_y_raw)
 {
     int32_t current_x;
     int32_t current_y;
@@ -529,48 +753,79 @@ static void update_qr_target_by_camera_sample(int32_t cam_x_raw, int32_t cam_y_r
     measured_x = clamp_i32(current_x + cam_x_used, MAP_FLY_X_MIN_CM, MAP_FLY_X_MAX_CM);
     measured_y = clamp_i32(current_y + cam_y_used, MAP_FLY_Y_MIN_CM, MAP_FLY_Y_MAX_CM);
 
-    if (s_qr_target_valid == 0)
+    if (s_target_valid == 0)
     {
-        s_qr_target_filt_x = measured_x;
-        s_qr_target_filt_y = measured_y;
-        s_qr_target_valid = 1;
+        s_target_filt_x = measured_x;
+        s_target_filt_y = measured_y;
+        s_target_valid = 1;
     }
     else
     {
-        s_qr_target_filt_x += (measured_x - s_qr_target_filt_x) / QR_TARGET_FILTER_DIV;
-        s_qr_target_filt_y += (measured_y - s_qr_target_filt_y) / QR_TARGET_FILTER_DIV;
+        s_target_filt_x += (measured_x - s_target_filt_x) / TARGET_FILTER_DIV;
+        s_target_filt_y += (measured_y - s_target_filt_y) / TARGET_FILTER_DIV;
     }
 
-    dis_x_target = step_to_i32(dis_x_target, s_qr_target_filt_x, QR_TARGET_MAX_STEP_CM);
-    dis_y_target = step_to_i32(dis_y_target, s_qr_target_filt_y, QR_TARGET_MAX_STEP_CM);
+    dis_x_target = step_to_i32(dis_x_target, s_target_filt_x, TARGET_MAX_STEP_CM);
+    dis_y_target = step_to_i32(dis_y_target, s_target_filt_y, TARGET_MAX_STEP_CM);
 
     dis_x_target = clamp_i32(dis_x_target, MAP_FLY_X_MIN_CM, MAP_FLY_X_MAX_CM);
     dis_y_target = clamp_i32(dis_y_target, MAP_FLY_Y_MIN_CM, MAP_FLY_Y_MAX_CM);
 }
 
-static void save_qr_report_position(void)
+static void update_red_x_report_estimate(int32_t cam_x_raw, int32_t cam_y_raw)
+{
+    int32_t current_x;
+    int32_t current_y;
+    int32_t cam_x_used;
+    int32_t cam_y_used;
+    int32_t measured_x;
+    int32_t measured_y;
+
+    get_radar_xy(&current_x, &current_y);
+
+    cam_x_used = scale_cam_pos(cam_x_raw);
+    cam_y_used = scale_cam_pos(cam_y_raw);
+
+    measured_x = clamp_i32(current_x + cam_x_used, MAP_FLY_X_MIN_CM, MAP_FLY_X_MAX_CM);
+    measured_y = clamp_i32(current_y + cam_y_used, MAP_FLY_Y_MIN_CM, MAP_FLY_Y_MAX_CM);
+
+    if (s_target_valid == 0)
+    {
+        s_target_filt_x = measured_x;
+        s_target_filt_y = measured_y;
+        s_target_valid = 1;
+    }
+    else
+    {
+        s_target_filt_x += (measured_x - s_target_filt_x) / TARGET_FILTER_DIV;
+        s_target_filt_y += (measured_y - s_target_filt_y) / TARGET_FILTER_DIV;
+    }
+}
+
+static void save_target_report_position(void)
 {
     int32_t report_x;
     int32_t report_y;
 
-    if (s_qr_target_valid)
+    if (s_target_valid)
     {
-        report_x = s_qr_target_filt_x;
-        report_y = s_qr_target_filt_y;
+        report_x = s_target_filt_x;
+        report_y = s_target_filt_y;
     }
     else
     {
         get_radar_xy(&report_x, &report_y);
     }
 
-    s_qr_report_x = (int16_t)clamp_i32(report_x, MAP_FLY_X_MIN_CM, MAP_FLY_X_MAX_CM);
-    s_qr_report_y = (int16_t)clamp_i32(report_y, MAP_FLY_Y_MIN_CM, MAP_FLY_Y_MAX_CM);
+    s_target_report_x = (int16_t)clamp_i32(report_x, MAP_FLY_X_MIN_CM, MAP_FLY_X_MAX_CM);
+    s_target_report_y = (int16_t)clamp_i32(report_y, MAP_FLY_Y_MIN_CM, MAP_FLY_Y_MAX_CM);
 }
 
 static void camera_approach_reset_state(void)
 {
     int32_t current_x;
     int32_t current_y;
+    Vision_Frame_t red_frame;
 
     get_radar_xy(&current_x, &current_y);
 
@@ -585,173 +840,144 @@ static void camera_approach_reset_state(void)
     s_center_hold_ms = 0;
     s_cam_lost_ms = 0;
 
-    s_qr_target_valid = 0;
-    s_qr_target_filt_x = current_x;
-    s_qr_target_filt_y = current_y;
+    s_red_valid_count = 0;
+    s_drop_finish_count = 0;
+    s_red_timeout_reported = 0;
+    s_red_lost_ms = 0;
+    s_line_lost_ms = LINE_TIMEOUT_MS + TASK_PERIOD_MS;
+    s_line_y_filt = 0;
 
-    s_cam_last_frame_cnt = g_maixcam_valid_frame_cnt;
+    s_target_valid = 0;
+    s_target_filt_x = current_x;
+    s_target_filt_y = current_y;
+
+    s_red_last_frame_cnt = g_maixcam_red_frame_cnt;
+    s_ctrl_last_frame_cnt = g_maixcam_ctrl_frame_cnt;
+    s_line_last_frame_cnt = g_maixcam_line_frame_cnt;
+
+    red_frame = latest_red_frame;
+    if (red_frame.valid && red_frame.code == s_target_code && red_frame.ctrl == CAMERA_CTRL_CAM)
+    {
+        s_camera_lock_seen = 1;
+        s_red_valid_count = RED_ENTER_CONFIRM_FRAMES;
+        s_red_x_filt = red_frame.x_cm;
+        s_red_y_filt = red_frame.y_cm;
+        update_red_x_report_estimate(red_frame.x_cm, red_frame.y_cm);
+        vision_control_set_red(s_red_x_filt, s_red_y_filt);
+    }
+    else
+    {
+        s_red_x_filt = 0;
+        s_red_y_filt = 0;
+        vision_control_set_none();
+    }
 }
 
 static uint8_t update_camera_approach_and_check_done(void)
 {
-    uint8_t new_frame;
-    uint8_t target_60_frame = 0;
-    uint8_t center_ok_now = 0;
-    uint8_t center_hold_condition = 0;
-    uint8_t pos_ok;
-    uint8_t height_ok;
-    int32_t cam_x = dis_x_cam_target;
-    int32_t cam_y = dis_y_cam_target;
+    uint8_t got_red_60 = 0;
+    uint8_t got_release_50 = 0;
+    Vision_Frame_t red_frame;
+    Vision_Frame_t ctrl_frame;
 
     s_camera_phase_ms += TASK_PERIOD_MS;
 
-    new_frame = maixcam_has_new_frame();
-    if (new_frame)
+    /* 红色×末端引导阶段：普通航点推进暂停，雷达只负责定住当前位置/定高/定航向。 */
+    radar_hold_current_position(DROP_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
+
+    if (g_maixcam_red_frame_cnt != s_red_last_frame_cnt)
     {
-        if (g_maixcam_last_ctrl == CAMERA_CTRL_CAM && camera_code_matches_target())
+        s_red_last_frame_cnt = g_maixcam_red_frame_cnt;
+        red_frame = latest_red_frame;
+
+        if (red_frame.valid && red_frame.code == s_target_code && red_frame.ctrl == CAMERA_CTRL_CAM)
         {
-            /* 只有目标二维码的 0x60 才认为相机真正锁定目标。
-             * 之后如果短暂出现 0x50，不会直接判定投放完成，而是进入释放候选等待。
-             */
-            target_60_frame = 1;
+            got_red_60 = 1;
             s_camera_lock_seen = 1;
-            s_cam_lost_ms = 0;
-            s_release_candidate_ms = 0;
+            s_red_lost_ms = 0;
+            s_drop_finish_count = 0;
+            s_red_timeout_reported = 0;
 
-            cam_x = g_maixcam_last_x;
-            cam_y = g_maixcam_last_y;
-
-            if (camera_sample_valid(cam_x, cam_y))
+            if (s_red_valid_count < 255)
             {
-                update_qr_target_by_camera_sample(cam_x, cam_y);
+                s_red_valid_count++;
+            }
 
-                if (abs_i32(cam_x) <= CAM_CENTER_RAW_TH_CM &&
-                    abs_i32(cam_y) <= CAM_CENTER_RAW_TH_CM)
+            if (camera_sample_valid(red_frame.x_cm, red_frame.y_cm))
+            {
+                if (s_red_valid_count <= RED_ENTER_CONFIRM_FRAMES)
                 {
-                    center_ok_now = 1;
-                    s_last_center_sample_ok = 1;
-                    s_center_lost_ms = 0;
+                    s_red_x_filt = red_frame.x_cm;
+                    s_red_y_filt = red_frame.y_cm;
                 }
                 else
                 {
-                    s_last_center_sample_ok = 0;
-                    s_center_lost_ms = 0;
+                    s_red_x_filt += ((int32_t)red_frame.x_cm - s_red_x_filt) / VISION_TASK_FILTER_DIV;
+                    s_red_y_filt += ((int32_t)red_frame.y_cm - s_red_y_filt) / VISION_TASK_FILTER_DIV;
                 }
+
+                update_red_x_report_estimate(red_frame.x_cm, red_frame.y_cm);
+                vision_control_set_red(s_red_x_filt, s_red_y_filt);
             }
         }
-        else if (g_maixcam_last_ctrl == CAMERA_CTRL_FC)
+    }
+
+    if (got_red_60 == 0)
+    {
+        if (s_red_lost_ms < 60000)
         {
-            /* 0x50 可能有三种情况：
-             * 1. 初次收到目标码后的待机 0x50；
-             * 2. 视觉过程中短暂丢目标/误发 0x50；
-             * 3. 舵机投放完成后的释放 0x50。
-             * 因此这里绝不能见到 0x50 就结束，必须等“曾经 0x60 锁定 + 中心停留达标 + 0x50 稳定确认”。
-             */
+            s_red_lost_ms += TASK_PERIOD_MS;
         }
     }
 
-    if (target_60_frame == 0)
+    if (g_maixcam_ctrl_frame_cnt != s_ctrl_last_frame_cnt)
     {
-        if (s_cam_lost_ms < 60000)
-        {
-            s_cam_lost_ms += TASK_PERIOD_MS;
-        }
+        s_ctrl_last_frame_cnt = g_maixcam_ctrl_frame_cnt;
+        ctrl_frame = latest_ctrl_frame;
 
-        if (s_center_lost_ms < 60000)
+        if (ctrl_frame.valid && ctrl_frame.code == s_target_code && ctrl_frame.ctrl == CAMERA_CTRL_FC)
         {
-            s_center_lost_ms += TASK_PERIOD_MS;
+            got_release_50 = 1;
         }
     }
 
-    pos_ok = pos_arrived_radar_cm(dis_x_target, dis_y_target, POS_ARRIVE_TH_CM);
-    height_ok = height_arrived_cm(DROP_HEIGHT_CM, hight, HEIGHT_ARRIVE_TH_CM);
-
-    /* 中心停留计时允许短时丢帧：
-     * - 当前 0x60 帧中心误差足够小，直接计时；
-     * - 刚刚中心对准过，但随后短时间丢帧/0x50，则在容错窗口内继续保持，不立刻清零；
-     * - 一旦已经满足 2s 停留要求，置位 s_center_dwell_ok，后续等待相机投放释放即可。
-     */
-    if (center_ok_now)
+    /* 只有进入红色×末端引导、且已经稳定见过若干帧 0x60 后，连续 0x50 才能表示投放完成。 */
+    if (got_release_50 && s_camera_lock_seen && s_red_valid_count >= RED_ENTER_CONFIRM_FRAMES)
     {
-        center_hold_condition = 1;
-    }
-    else if (s_last_center_sample_ok && s_center_lost_ms <= CAM_CENTER_LOST_GRACE_MS)
-    {
-        center_hold_condition = 1;
-    }
-
-    if (s_center_dwell_ok == 0)
-    {
-        if (pos_ok && height_ok && center_hold_condition)
+        if (s_drop_finish_count < 255)
         {
-            if (s_center_hold_ms < 60000)
-            {
-                s_center_hold_ms += TASK_PERIOD_MS;
-            }
-            save_qr_report_position();
-
-            if (s_center_hold_ms >= QR_CENTER_HOLD_MIN_MS)
-            {
-                s_center_dwell_ok = 1;
-                s_center_hold_ms = QR_CENTER_HOLD_MIN_MS;
-                my_send_esp_1_test(0xD2); /* 调试：二维码上方停留时间达标 */
-            }
-        }
-        else
-        {
-            s_center_hold_ms = 0;
-        }
-    }
-
-    if (s_cam_lost_ms > CAM_LOST_HOLD_MS && s_center_dwell_ok == 0)
-    {
-        /* 未完成 2s 停留前，如果长时间没有目标 0x60，就先悬停在当前位置，避免盲目漂移。 */
-        radar_hold_current_position(DROP_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
-    }
-    else
-    {
-        /* 已经有二维码估计点时，继续守住最后的目标点；短时丢帧/0x50 不改变目标。 */
-        radar_update_target(dis_x_target, dis_y_target, DROP_HEIGHT_CM,
-                            s_center_dwell_ok ? RADAR_HOLD_SPEED_LIMIT_CMPS : CAMERA_TRACK_SPEED_LIMIT_CMPS);
-    }
-
-    /* 释放确认：必须先完成二维码中心上方 2s 停留。
-     * 若中间又出现 0x60，说明目标又被识别到了，释放候选会被清零并继续视觉跟踪。
-     */
-    if (s_center_dwell_ok && s_camera_lock_seen && g_maixcam_last_ctrl == CAMERA_CTRL_FC)
-    {
-        if (s_release_candidate_ms < 60000)
-        {
-            s_release_candidate_ms += TASK_PERIOD_MS;
+            s_drop_finish_count++;
         }
 
-        if (s_release_candidate_ms >= CAMERA_RELEASE_CONFIRM_MS)
+        if (s_drop_finish_count >= DROP_FINISH_CONFIRM_FRAMES)
         {
             s_camera_release_seen = 1;
-            my_send_esp_1_test(0xD0); /* 调试：相机释放控制权/投放完成 */
+            save_target_report_position();
+            vision_control_set_none();
+            my_send_esp_1_test(0xD0); /* 调试：稳定收到0x50，确认相机端已投放完成 */
+            return 1;
         }
     }
 
-    if (s_camera_release_seen)
+    if (s_red_lost_ms > RED_GUIDE_TIMEOUT_MS)
     {
-        save_qr_report_position();
-        return 1;
-    }
+        /* 长时间没有红色× 0x60：清零视觉速度，保持悬停，等待重新锁定或相机投放后的 0x50。 */
+        vision_control_set_none();
+        radar_hold_current_position(DROP_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
 
-    /* 兜底：避免相机一直不释放导致飞机无限悬停。实机若不需要可把超时时间调大。 */
-    if (s_camera_phase_ms >= CAMERA_APPROACH_TIMEOUT_MS && s_qr_target_valid)
-    {
-        save_qr_report_position();
-        my_send_esp_1_test(0xE1); /* 调试：视觉阶段超时，使用当前二维码估计坐标返航 */
-        return 1;
+        if (s_red_timeout_reported == 0)
+        {
+            s_red_timeout_reported = 1;
+            my_send_esp_1_test(0xE2); /* 调试：红色×视觉超时，已清零视觉修正并悬停 */
+        }
     }
 
     return 0;
 }
 
-static void report_qr_result_once(void)
+static void report_target_result_once(void)
 {
-    my_send_esp_qr_message(DEVICE_BROADCAST, s_target_qr_code, s_qr_report_x, s_qr_report_y);
+    my_send_esp_qr_message(DEVICE_BROADCAST, s_target_code, s_target_report_x, s_target_report_y);
 }
 
 void UserTask_OneKeyCmd(void)
@@ -827,12 +1053,12 @@ void UserTask_OneKeyCmd(void)
         if (step_entered())
         {
             all_data_init();
-            s_target_qr_code = current_selected_qr_code();
-            cam_target_code_identity_flag = s_target_qr_code;
+            s_target_code = current_selected_target_code();
+            cam_target_code_identity_flag = s_target_code;
             MY_uart_maixcam_clear_state();
-            MY_uart_maixcam_send(s_target_qr_code);
+            MY_uart_maixcam_send(s_target_code);
             s_camera_resend_ms = 0;
-            my_send_esp_1_test(s_target_qr_code); /* 调试：确认本次任务目标二维码 */
+            my_send_esp_1_test(s_target_code); /* 调试：确认本次任务红色×目标 */
         }
 
         mission_step += FC_Unlock();
@@ -848,6 +1074,8 @@ void UserTask_OneKeyCmd(void)
 
             s_route_id = select_route_id();
             s_wp_index = 0;
+            s_resume_wp_index = 0;
+            s_drop_done = 0;
 
             s_cam_last_frame_cnt = g_maixcam_valid_frame_cnt;
             s_camera_started = 0;
@@ -857,7 +1085,20 @@ void UserTask_OneKeyCmd(void)
             s_last_center_sample_ok = 0;
             s_center_lost_ms = 0;
             s_release_candidate_ms = 0;
-            s_qr_target_valid = 0;
+            s_target_valid = 0;
+            s_line_last_frame_cnt = g_maixcam_line_frame_cnt;
+            s_red_last_frame_cnt = g_maixcam_red_frame_cnt;
+            s_ctrl_last_frame_cnt = g_maixcam_ctrl_frame_cnt;
+            s_line_lost_ms = LINE_TIMEOUT_MS + TASK_PERIOD_MS;
+            s_red_lost_ms = RED_GUIDE_TIMEOUT_MS + TASK_PERIOD_MS;
+            s_red_enter_valid_count = 0;
+            s_red_valid_count = 0;
+            s_drop_finish_count = 0;
+            s_red_timeout_reported = 0;
+            s_line_y_filt = 0;
+            s_red_x_filt = 0;
+            s_red_y_filt = 0;
+            vision_control_set_none();
 
             radar_enter_mode_once();
             radar_update_target(0, 0, TAKEOFF_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
@@ -866,7 +1107,7 @@ void UserTask_OneKeyCmd(void)
         }
 
         radar_update_target(0, 0, TAKEOFF_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
-        send_qr_to_camera_periodically(1000);
+        send_target_to_camera_periodically(1000);
 
         if (step_wait_ms(1000))
         {
@@ -884,7 +1125,7 @@ void UserTask_OneKeyCmd(void)
         }
 
         radar_update_target(0, 0, TAKEOFF_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
-        send_qr_to_camera_periodically(1000);
+        send_target_to_camera_periodically(1000);
 
         pos_ok = pos_arrived_radar_cm(0, 0, POS_ARRIVE_TH_CM);
         height_ok = height_arrived_cm(TAKEOFF_HEIGHT_CM, hight, HEIGHT_ARRIVE_TH_CM);
@@ -907,11 +1148,12 @@ void UserTask_OneKeyCmd(void)
         }
 
         radar_update_target(0, 0, SEARCH_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
-        send_qr_to_camera_periodically(1000);
+        disable_line_assist();
+        send_target_to_camera_periodically(1000);
 
         if (camera_triggered_target())
         {
-            mission_step = STEP_CAMERA_APPROACH;
+            enter_camera_approach_from_route(0);
             break;
         }
 
@@ -929,13 +1171,14 @@ void UserTask_OneKeyCmd(void)
     {
         if (camera_triggered_target())
         {
-            mission_step = STEP_CAMERA_APPROACH;
+            /* 在飞向当前航点途中发现投掷区：先保存当前索引；真正恢复航点在 STEP_REPORT_RESULT 中统一决定。 */
+            enter_camera_approach_from_route(s_wp_index);
             break;
         }
 
         if (s_wp_index >= get_route_len(s_route_id))
         {
-            mission_step = STEP_RETURN_HOME;
+            mission_step = STEP_ROUTE_END_GOTO;
             break;
         }
 
@@ -949,7 +1192,8 @@ void UserTask_OneKeyCmd(void)
         }
 
         radar_update_target(wp.x, wp.y, SEARCH_HEIGHT_CM, CRUISE_SPEED_LIMIT_CMPS);
-        send_qr_to_camera_periodically(1000);
+        update_line_assist_for_cruise();
+        send_target_to_camera_periodically(1000);
 
         pos_ok = pos_arrived_radar_cm(wp.x, wp.y, POS_ARRIVE_TH_CM);
         height_ok = height_arrived_cm(SEARCH_HEIGHT_CM, hight, HEIGHT_ARRIVE_TH_CM);
@@ -966,7 +1210,8 @@ void UserTask_OneKeyCmd(void)
     {
         if (camera_triggered_target())
         {
-            mission_step = STEP_CAMERA_APPROACH;
+            /* 在航点悬停阶段发现投掷区：说明当前航点已经到过，投放完成后从下一航点继续。 */
+            enter_camera_approach_from_route((uint8_t)(s_wp_index + 1));
             break;
         }
 
@@ -979,7 +1224,8 @@ void UserTask_OneKeyCmd(void)
         }
 
         radar_update_target(wp.x, wp.y, SEARCH_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
-        send_qr_to_camera_periodically(1000);
+        disable_line_assist();
+        send_target_to_camera_periodically(1000);
 
         if (step_wait_ms(WAYPOINT_HOLD_MS))
         {
@@ -987,7 +1233,7 @@ void UserTask_OneKeyCmd(void)
 
             if (s_wp_index >= get_route_len(s_route_id))
             {
-                mission_step = STEP_RETURN_HOME;
+                mission_step = STEP_ROUTE_END_GOTO;
             }
             else
             {
@@ -1005,6 +1251,7 @@ void UserTask_OneKeyCmd(void)
             camera_approach_reset_state();
             radar_hold_current_position(DROP_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
             my_send_esp_1_test(0x60); /* 调试：进入视觉辅助定位/投放阶段 */
+            my_send_esp_1_test(0x10); /* 到达投掷区上空，激活喇叭和灯光提醒 */
         }
 
         if (update_camera_approach_and_check_done())
@@ -1020,12 +1267,13 @@ void UserTask_OneKeyCmd(void)
         {
             s_report_repeat_cnt = 0;
             s_report_interval_ms = 0;
-            report_qr_result_once();
+            report_target_result_once();
             s_report_repeat_cnt++;
-            my_send_esp_1_test(0xD1); /* 调试：开始广播二维码坐标 */
+            my_send_esp_1_test(0xD1); /* 调试：开始广播红色×坐标 */
         }
 
         radar_update_target(dis_x_target, dis_y_target, DROP_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
+        vision_control_set_none();
 
         if (s_report_repeat_cnt < REPORT_REPEAT_COUNT)
         {
@@ -1033,48 +1281,72 @@ void UserTask_OneKeyCmd(void)
             if (s_report_interval_ms >= REPORT_REPEAT_INTERVAL_MS)
             {
                 s_report_interval_ms = 0;
-                report_qr_result_once();
+                report_target_result_once();
                 s_report_repeat_cnt++;
             }
         }
         else
         {
-            mission_step = STEP_RETURN_HOME;
+            /*
+             * 投掷完成后锁存，避免红色×仍在视野中导致再次进入投放阶段。
+             * 关键修复：不要无条件回到 s_resume_wp_index。
+             * 当前 route_0 如果使用旧的 index 7 会越界并直接进入最后航点，
+             * 因此通过 get_drop_done_resume_wp_index() 按坐标恢复到 (160, -160)。
+             */
+            s_drop_done = 1;
+            s_wp_index = get_drop_done_resume_wp_index();
+            my_send_esp_1_test((uint8_t)(0xE0 + (s_wp_index & 0x0F))); /* 调试：投放后恢复航点，当前 route_0 期望 0xE3 */
+
+            if (s_wp_index >= get_route_len(s_route_id))
+            {
+                mission_step = STEP_ROUTE_END_GOTO;
+            }
+            else
+            {
+                mission_step = STEP_GOTO_WAYPOINT;
+            }
         }
     }
     break;
 
-    case STEP_RETURN_HOME:
+    case STEP_ROUTE_END_GOTO:
     {
+        wp = get_last_waypoint(s_route_id);
+
         if (step_entered())
         {
             radar_enter_mode_once();
-            radar_update_target(0, 0, SEARCH_HEIGHT_CM, RETURN_SPEED_LIMIT_CMPS);
-            my_send_esp_1_test(0xC0); /* 调试：开始返航 */
+            radar_update_target(wp.x, wp.y, SEARCH_HEIGHT_CM, RETURN_SPEED_LIMIT_CMPS);
+            // my_send_esp_1_test(0xC0); /* 调试：开始飞向最后一个航点 */
         }
 
-        radar_update_target(0, 0, SEARCH_HEIGHT_CM, RETURN_SPEED_LIMIT_CMPS);
+        radar_update_target(wp.x, wp.y, SEARCH_HEIGHT_CM, RETURN_SPEED_LIMIT_CMPS);
+        update_line_assist_for_cruise();
 
-        pos_ok = pos_arrived_radar_cm(0, 0, HOME_ARRIVE_TH_CM);
+        pos_ok = pos_arrived_radar_cm(wp.x, wp.y, HOME_ARRIVE_TH_CM);
         height_ok = height_arrived_cm(SEARCH_HEIGHT_CM, hight, HEIGHT_ARRIVE_TH_CM);
         yaw_ok = yaw_arrived(YAW_ARRIVE_TH_DEG);
 
         if (stable_counter_check((uint8_t)(pos_ok && height_ok && yaw_ok), HOME_STABLE_CNT))
         {
-            mission_step = STEP_HOME_HOLD;
+            mission_step = STEP_ROUTE_END_HOLD;
         }
     }
     break;
 
-    case STEP_HOME_HOLD:
+    case STEP_ROUTE_END_HOLD:
     {
+        wp = get_last_waypoint(s_route_id);
+
         if (step_entered())
         {
             radar_enter_mode_once();
-            radar_update_target(0, 0, SEARCH_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
+            radar_update_target(wp.x, wp.y, SEARCH_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
+            my_send_esp_1_test(0xC3); /* 调试：最后一个航点悬停，准备降落 */
         }
 
-        radar_update_target(0, 0, SEARCH_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
+        radar_update_target(wp.x, wp.y, SEARCH_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
+        disable_line_assist();
 
         if (step_wait_ms(HOME_HOLD_BEFORE_LAND_MS))
         {
@@ -1087,10 +1359,12 @@ void UserTask_OneKeyCmd(void)
     {
         if (step_entered())
         {
+            wp = get_last_waypoint(s_route_id);
             radar_enter_mode_once();
-            radar_update_target(0, 0, SEARCH_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
+            radar_update_target(wp.x, wp.y, SEARCH_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
+            vision_control_set_none();
             s_auto_land_cmd_latch = 0;
-            my_send_esp_1_test(0xC1); /* 调试：执行自动降落 */
+            my_send_esp_1_test(0xC1); /* 调试：在最后一个航点执行自动降落 */
         }
 
         if (s_auto_land_cmd_latch == 0)
@@ -1113,6 +1387,7 @@ void UserTask_OneKeyCmd(void)
             my_send_esp_1_test(0xC2); /* 调试：完整救援任务结束 */
         }
 
+        vision_control_set_none();
         s_mission_enable = 0;
         my_task_flag = 0;
         mission_step = STEP_IDLE;
@@ -1121,10 +1396,12 @@ void UserTask_OneKeyCmd(void)
 
     default:
     {
-        /* 异常兜底：进入雷达定点并返航。 */
+        /* 异常兜底：进入雷达定点并飞向最后一个航点。 */
         radar_enter_mode_once();
-        radar_update_target(0, 0, SEARCH_HEIGHT_CM, RETURN_SPEED_LIMIT_CMPS);
-        mission_step = STEP_RETURN_HOME;
+        vision_control_set_none();
+        wp = get_last_waypoint(s_route_id);
+        radar_update_target(wp.x, wp.y, SEARCH_HEIGHT_CM, RETURN_SPEED_LIMIT_CMPS);
+        mission_step = STEP_ROUTE_END_GOTO;
     }
     break;
     }
