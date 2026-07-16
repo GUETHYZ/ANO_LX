@@ -36,20 +36,20 @@
 
 #define HEIGHT_ARRIVE_TH_CM 10
 #define POS_ARRIVE_TH_CM 10
-#define HOME_ARRIVE_TH_CM 5
-#define YAW_ARRIVE_TH_DEG 3.0f
+#define HOME_ARRIVE_TH_CM 7
+#define YAW_ARRIVE_TH_DEG 2.0f
 
 /* 速度上限。最后实机时建议先保持保守，确认稳定后再小幅提高 CRUISE/RETURN。 */
-#define CRUISE_SPEED_LIMIT_CMPS 12
-#define RETURN_SPEED_LIMIT_CMPS 12
+#define CRUISE_SPEED_LIMIT_CMPS 25
+#define RETURN_SPEED_LIMIT_CMPS 30
 #define RADAR_HOLD_SPEED_LIMIT_CMPS 12
 #define CAMERA_TRACK_SPEED_LIMIT_CMPS 15
 
 #define TAKEOFF_STABLE_CNT 25  /* 500ms */
 #define WAYPOINT_STABLE_CNT 10 /* 200ms */
 #define HOME_STABLE_CNT 30     /* 600ms */
-#define WAYPOINT_HOLD_MS 1500
-#define MAP_BUILD_HOLD_MS 6000
+#define WAYPOINT_HOLD_MS 1000
+#define MAP_BUILD_HOLD_MS 3000
 #define HOME_HOLD_BEFORE_LAND_MS 1500
 
 #define CH_SWITCH_HIGH_TH 1700
@@ -75,10 +75,12 @@
 
 #define CAM_RAW_ABS_LIMIT_CM 150
 #define CAM_USED_ABS_LIMIT_CM 240
-#define CAM_CENTER_RAW_TH_CM 6
+#define CAM_CENTER_RAW_TH_CM 15
 #define CAM_LOST_HOLD_MS 1000
 #define CAM_CENTER_LOST_GRACE_MS 300  /* 视觉短时丢帧/误发 0x50 时，中心保持计时的容错窗口 */
-#define CAMERA_RELEASE_CONFIRM_MS 400 /* 投放完成 0x50 需要稳定持续一段时间才确认释放 */
+#define CAMERA_RELEASE_CONFIRM_MS 400 /* 普通 0x50 需要稳定持续一段时间才确认释放 */
+#define CAMERA_RELEASE_MAGIC_X_CM 1   /* MaixCam 投掷完成后 0x50 的 x 标记：普通 0x50 为 0 */
+#define CAMERA_RELEASE_MAGIC_Y_CM 1   /* MaixCam 投掷完成后 0x50 的 y 标记：普通 0x50 为 0 */
 #define QR_TARGET_FILTER_DIV 4
 #define QR_TARGET_MAX_STEP_CM 10
 
@@ -86,7 +88,7 @@
 #define QR_CENTER_HOLD_MIN_MS 2200 /* 规则要求 2s 以上，这里留 200ms 裕量 */
 #define CAMERA_APPROACH_TIMEOUT_MS 25000
 #define REPORT_REPEAT_COUNT 8
-#define REPORT_REPEAT_INTERVAL_MS 100
+#define REPORT_REPEAT_INTERVAL_MS 120
 
 /* 依据你实测的安全地图范围：x 最大 240~250，y 最大 300。 */
 #define MAP_FLY_X_MIN_CM 0
@@ -126,38 +128,38 @@ static const waypoint_t route_0[] =
     {
         {60, 60},
         {120, 60},
-        {220, 60},
-        {220, 120},
-        {220, 150},
+        {235, 60},
+        {235, 150},
         {120, 150},
-        {60, 150},
-        {60, 240},
-        {120, 240},
-        {220, 240},
-        {220, 300},
-        {120, 300}};
+        {10, 150},
+        {10, 250},
+        {120, 250},
+        {240, 250},
+        {240, 300},
+        {120, 300},
+        {10, 300}};
 
 /* 航线 1：纵向条带扫描，适合从左到右覆盖。 */
 static const waypoint_t route_1[] =
     {
-        {70, 60},
-        {70, 300},
-        {160, 300},
-        {160, 60},
-        {170, 60},
+        {0, 60},
+        {0, 300},
+        {150, 300},
+        {150, 60},
         {190, 60},
-        {220, 60},
-        {220, 300}};
+        {190, 300},
+        {240, 300},
+        {240, 60}};
 
 /* 航线 2：斜向折线扫描，减少重复路径并覆盖三个二维码可能区域。 */
 static const waypoint_t route_2[] =
     {
         {60, 80},
-        {220, 120},
-        {70, 190},
-        {220, 250},
-        {130, 300},
-        {60, 260}};
+        {240, 120},
+        {20, 190},
+        {240, 250},
+        {10, 300},
+        {240, 300}};
 
 #define ROUTE_0_LEN ((uint8_t)(sizeof(route_0) / sizeof(route_0[0])))
 #define ROUTE_1_LEN ((uint8_t)(sizeof(route_1) / sizeof(route_1[0])))
@@ -592,6 +594,43 @@ static void camera_approach_reset_state(void)
     s_cam_last_frame_cnt = g_maixcam_valid_frame_cnt;
 }
 
+/*
+ * 判断 MaixCam 的 0x50 是否表示“投掷完成”。
+ *
+ * 现在相机端约定：
+ *   0x50 + (0,0)：初始待机 / 暂时未识别 / 普通丢帧，不代表投掷完成；
+ *   0x50 + (1,1)：舵机投掷动作完成后的释放标记。
+ *
+ * 因此：
+ * 1. 只要已经见过目标二维码的 0x60，收到 0x50+(1,1) 就立即认为投掷完成；
+ * 2. 为兼容旧相机逻辑，如果飞控自己确认中心停留达标，则普通 0x50 稳定一段时间后也可释放。
+ */
+static uint8_t camera_release_frame_is_drop_done(void)
+{
+    if (g_maixcam_last_ctrl != CAMERA_CTRL_FC)
+    {
+        return 0;
+    }
+
+    if (!camera_code_matches_target())
+    {
+        return 0;
+    }
+
+    if (g_maixcam_last_x == CAMERA_RELEASE_MAGIC_X_CM &&
+        g_maixcam_last_y == CAMERA_RELEASE_MAGIC_Y_CM)
+    {
+        return 2; /* 魔术释放帧：一帧即可确认 */
+    }
+
+    if (s_center_dwell_ok)
+    {
+        return 1; /* 普通 0x50：需要持续确认 */
+    }
+
+    return 0;
+}
+
 static uint8_t update_camera_approach_and_check_done(void)
 {
     uint8_t new_frame;
@@ -715,20 +754,32 @@ static uint8_t update_camera_approach_and_check_done(void)
                             s_center_dwell_ok ? RADAR_HOLD_SPEED_LIMIT_CMPS : CAMERA_TRACK_SPEED_LIMIT_CMPS);
     }
 
-    /* 释放确认：必须先完成二维码中心上方 2s 停留。
-     * 若中间又出现 0x60，说明目标又被识别到了，释放候选会被清零并继续视觉跟踪。
+    /* 释放确认：
+     * - 推荐逻辑：MaixCam 舵机动作完成后发送 0x50+(1,1)，一帧即可确认，避免相机端只发出一帧或短时间发送时飞控错过 400ms 窗口；
+     * - 兼容逻辑：普通 0x50+(0,0) 只有在飞控自己确认二维码上方停留达标后，才需要稳定持续 CAMERA_RELEASE_CONFIRM_MS。
+     * - 如果中间又出现 0x60，s_release_candidate_ms 会在上方被清零，继续视觉跟踪。
      */
-    if (s_center_dwell_ok && s_camera_lock_seen && g_maixcam_last_ctrl == CAMERA_CTRL_FC)
+    if (s_camera_lock_seen)
     {
-        if (s_release_candidate_ms < 60000)
-        {
-            s_release_candidate_ms += TASK_PERIOD_MS;
-        }
+        uint8_t release_type = camera_release_frame_is_drop_done();
 
-        if (s_release_candidate_ms >= CAMERA_RELEASE_CONFIRM_MS)
+        if (release_type == 2)
         {
             s_camera_release_seen = 1;
-            my_send_esp_1_test(0xD0); /* 调试：相机释放控制权/投放完成 */
+            my_send_esp_1_test(0xD0); /* 调试：收到 0x50+(1,1)，确认投掷完成 */
+        }
+        else if (release_type == 1)
+        {
+            if (s_release_candidate_ms < 60000)
+            {
+                s_release_candidate_ms += TASK_PERIOD_MS;
+            }
+
+            if (s_release_candidate_ms >= CAMERA_RELEASE_CONFIRM_MS)
+            {
+                s_camera_release_seen = 1;
+                my_send_esp_1_test(0xD0); /* 调试：普通 0x50 稳定确认释放 */
+            }
         }
     }
 
@@ -1005,6 +1056,7 @@ void UserTask_OneKeyCmd(void)
             camera_approach_reset_state();
             radar_hold_current_position(DROP_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);
             my_send_esp_1_test(0x60); /* 调试：进入视觉辅助定位/投放阶段 */
+            my_send_esp_1_test(0x10);
         }
 
         if (update_camera_approach_and_check_done())
@@ -1022,7 +1074,6 @@ void UserTask_OneKeyCmd(void)
             s_report_interval_ms = 0;
             report_qr_result_once();
             s_report_repeat_cnt++;
-            my_send_esp_1_test(0xD1); /* 调试：开始广播二维码坐标 */
         }
 
         radar_update_target(dis_x_target, dis_y_target, DROP_HEIGHT_CM, RADAR_HOLD_SPEED_LIMIT_CMPS);

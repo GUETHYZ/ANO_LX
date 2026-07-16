@@ -10,8 +10,8 @@ double KP_radar = 0.45, KI_radar = 0, KD_radar = 0.05;
 
 double KP_MV = 0.6, KI_MV = 0, KD_MV = 0;
 // 视觉联调单独给前后/左右两个轴留调参入口。
-double KP_MV_X = 0.2;
-double KP_MV_Y = 0.2;
+double KP_MV_X = 0.3;
+double KP_MV_Y = 0.3;
 
 /* 视觉位置环 D 项：先从小值开始 */
 double KD_MV_X = 0.08;

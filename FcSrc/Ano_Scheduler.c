@@ -80,7 +80,8 @@ static void Loop_20Hz(void) // 50ms??????
 
 static void Loop_2Hz(void) // 500ms??????
 {
-	
+	// my_send_esp_qr_message(DEVICE_BROADCAST, s_target_qr_code, s_qr_report_x, s_qr_report_y);
+	//my_send_esp_qr_message(DEVICE_BROADCAST, 0xCA, 100, 100);
 }
 //////////////////////////////////////////////////////////////////////
 // ???????????

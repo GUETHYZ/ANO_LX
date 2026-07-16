@@ -72,7 +72,7 @@ void my_send_esp_qr_message(uint8_t device, uint8_t qr_type, int16_t qr_x, int16
     DataSend[_cnt++] = RESCUE_HEAD_2;                  // 0xBB
     DataSend[_cnt++] = device;                         // 目标设备 / 设备类型
     DataSend[_cnt++] = qr_type;                        // 二维码类型：0xCA / 0xCB / 0xCC
-    DataSend[_cnt++] = (uint8_t)((x_raw >> 8) & 0xFF); // X 高字节
+    DataSend[_cnt++] = (uint8_t)((x_raw >> 8) & 0xFF); // X 高
     DataSend[_cnt++] = (uint8_t)(x_raw & 0xFF);        // X 低字节
     DataSend[_cnt++] = (uint8_t)((y_raw >> 8) & 0xFF); // Y 高字节
     DataSend[_cnt++] = (uint8_t)(y_raw & 0xFF);        // Y 低字节
